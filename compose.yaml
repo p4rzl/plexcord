@@ -1,0 +1,24 @@
+services:
+  plexcord:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    volumes:
+      - plexcord-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+volumes:
+  plexcord-data:
