@@ -14,7 +14,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             bot = Plexcord(directory)
             commands = {command.name: command for command in bot.tree.get_commands()}
-            self.assertEqual(set(commands), {"plex", "settings", "play", "queue", "now", "pause", "resume", "skip", "stop", "leave", "shuffle", "help"})
+            self.assertEqual(set(commands), {"plex", "settings", "play", "playlist", "queue", "now", "pause", "resume", "skip", "stop", "leave", "shuffle", "activity", "mode", "link", "unlink", "help"})
             self.assertFalse(bot.intents.message_content)
             self.assertFalse(bot.intents.members)
             self.assertTrue(bot.intents.voice_states)
@@ -75,4 +75,28 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                     await player_view.interaction_check(outsider_interaction)
             finally:
                 player_view.stop()
+                await bot.close()
+
+    async def test_activity_token_and_context_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = Plexcord(directory)
+            try:
+                channel = SimpleNamespace(id=10, members=[SimpleNamespace(bot=False)])
+                guild = SimpleNamespace(
+                    id=1,
+                    voice_client=SimpleNamespace(channel=channel),
+                    get_channel=lambda cid: channel if cid == 10 else None,
+                    voice_channels=[channel],
+                )
+                bot.get_guild = lambda gid: guild if gid == 1 else None
+                token = bot.activity_server.sign(1, 10)
+                request = SimpleNamespace(query={"token": token})
+                resolved_guild, resolved_channel = bot.activity_server.resolve_context(request, require_active=True)
+                self.assertIs(resolved_guild, guild)
+                self.assertIs(resolved_channel, channel)
+
+                bad_request = SimpleNamespace(query={"token": "1:10:9999999999:invalid"})
+                with self.assertRaises(PlexError):
+                    bot.activity_server.resolve_context(bad_request)
+            finally:
                 await bot.close()

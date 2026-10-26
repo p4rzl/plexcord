@@ -4,6 +4,8 @@ services:
     restart: unless-stopped
     init: true
     env_file: .env
+    ports:
+      - "${PLEXCORD_ACTIVITY_PORT:-8080}:${PLEXCORD_ACTIVITY_PORT:-8080}"
     volumes:
       - plexcord-data:/app/data
     read_only: true

@@ -1,20 +1,32 @@
 # Plexcord
 
-Bot Discord leggero per ascoltare i brani del proprio server Plex nei canali vocali. **Login, scelta del server, librerie e impostazioni si gestiscono da Discord**. All'avvio serve soltanto il token del bot Discord.
+Bot Discord ultraleggero per ascoltare i brani e le playlist del proprio server Plex nei canali vocali, con supporto completo per **Discord Activity (Embedded App SDK)**, **Discord Rich Presence (RPC)** personale e **sincronizzazione con la Dashboard Plex**.
 
-## Funzionalità
+**Login, scelta del server, librerie, playlist e impostazioni si gestiscono direttamente da Discord** (sia tramite **Comandi Slash** sia dall'**Activity grafica**). All'avvio serve soltanto il token del bot Discord.
 
-- Comandi slash e messaggi di configurazione privati (ephemeral).
-- Login Plex tramite link ufficiale e pulsante di conferma: nessuna password inserita in Discord. Compatibile con il login/2FA gestito dal sito Plex.
-- Scelta di un server Plex tra quelli accessibili all'account, anche condivisi.
-- Ricerca contemporanea in tutte le librerie musicali abilitate, oppure in una sola. Confronto normalizzato di accenti/apostrofi, priorità ai titoli esatti e menu paginato. Ogni risultato indica la libreria di origine.
-- Coda, pausa, ripresa, salto, mescolamento, stato e disconnessione automatica a coda vuota.
-- Volume, bitrate Opus, timeout, limite coda e ruolo DJ configurabili con `/settings`.
-- Configurazione persistente SQLite, separata per ogni server Discord.
-- Docker Compose, processo non-root, filesystem read-only e volume persistente.
-- Supporto vocale Discord/DAVE tramite `discord.py[voice]` 2.7.1 o superiore.
+---
 
-Nessun Lavalink, Redis, server web o database esterno. Un processo FFmpeg per riproduzione attiva; niente download dei brani su disco né indicizzazione completa delle librerie. Il consumo effettivo dipende da formato dei file, hardware e numero di riproduzioni simultanee: misuralo con `docker stats`.
+## Funzionalità Principali
+
+- **Doppia modalità operativa (`/mode`)**:
+  - **🎛️ Modalità Activity**: controlla e configura l'intero bot dall'interfaccia grafica dentro il canale vocale di Discord (o via Web Player).
+  - **💬 Modalità Comandi Slash**: usa i comandi slash classici (`/play`, `/playlist`, `/queue`, `/plex`, `/settings`, ecc.) con autocompletamento e pulsanti interattivi.
+- **Controllo condiviso nel canale vocale**: chiunque si trovi nello stesso canale vocale del bot può cercare brani, gestire la riproduzione e usare i pulsanti interattivi (`⏯️ Pausa/Riprendi`, `⏭️ Salta`, `🔀 Mescola`, `⏹️ Stop`, `👋 Esci`) o la Discord Activity.
+- **Discord Activity (Embedded App SDK) & Web Player integrato**:
+  - Interfaccia responsiva (si adatta automaticamente anche quando si apre la chat laterale del canale vocale di Discord).
+  - **Ricerca live con miniature delle copertine** per titolo del brano o nome dell'autore, con tasti **▶️ Ora** (riproduci subito) e **➕ Coda**.
+  - **🎶 Playlist personali Plex**: collegando il proprio account Plex, ogni utente può sfogliare le proprie playlist audio, aprirle per vedere i singoli brani oppure riprodurle interamente (anche in modalità **🔀 Shuffle**).
+  - **Volume in tempo reale (0–150%)**: regolazione istantanea del volume (ogni 20ms su stream PCM → Opus) **senza mai bloccare o riavviare la canzone**.
+  - **Seek interattivo** cliccando sulla barra di avanzamento e gestione completa della coda (riproduci subito, sposta in cima, rimuovi).
+- **🟣 Discord Rich Presence (RPC) & 🎧 Scrobbling Plex**:
+  - **RPC sul profilo personale Discord**: autorizzando l'app nell'Activity (`🟣 Attiva RPC Utente`), il brano in ascolto, l'artista, l'album e il timer live compaiono direttamente sul **tuo profilo personale Discord** (*"Sta ascoltando..."*).
+  - **Collegamento Account Plex con PIN a 4 cifre (`plex.tv/link`)**: collegando il tuo account Plex (dalla scheda `🎧 RPC & Account` o con `/link`), la tua attività di ascolto viene mostrata in tempo reale anche sulla **Dashboard di Plex** e aggiorna le statistiche di ascolto del tuo profilo Plex.
+- **Ricerca intelligente e tollerante agli errori**:
+  - Ricerca contemporanea in tutte le librerie musicali abilitate per **titolo del brano**, **nome dell'autore** o entrambi, tollerante ad accenti, punteggiatura e piccoli errori di battitura.
+- **Ultraleggero e sicuro**:
+  - Nessun Lavalink, Redis, Node.js o database esterno. Persistenza in SQLite, processo Docker non-root e filesystem read-only.
+
+---
 
 ## 1. Crea il bot Discord
 
@@ -22,9 +34,11 @@ Nessun Lavalink, Redis, server web o database esterno. Un processo FFmpeg per ri
 2. Genera/copia il token. **Non pubblicarlo e non inserirlo in un comando Discord.**
 3. In **OAuth2 → URL Generator**, seleziona gli scope `bot` e `applications.commands`.
 4. Permessi del bot: **View Channels**, **Send Messages**, **Connect**, **Speak**. Non serve Administrator.
-5. Apri il link generato e invita il bot nel tuo server. Controlla anche gli override dei permessi nei canali.
+5. Apri il link generato e invita il bot nel tuo server.
 
-Non servono intent privilegiati: **Message Content**, **Server Members** e **Presence** possono restare disabilitati. Chi usa i comandi deve poter usare i comandi delle applicazioni nel canale.
+Non servono intent privilegiati: **Message Content**, **Server Members** e **Presence** possono restare disabilitati.
+
+---
 
 ## 2. Avvia con Docker
 
@@ -42,45 +56,36 @@ Copy-Item .env.example .env
 cp .env.example .env
 ```
 
-Modifica `.env` e imposta `DISCORD_TOKEN`. Facoltativamente inserisci `DISCORD_GUILD_ID` per pubblicare subito i comandi in un solo server di sviluppo. Trovi l'ID attivando la modalità sviluppatore Discord e facendo clic destro sul server → Copia ID.
+Modifica `.env` e imposta `DISCORD_TOKEN`:
+
+| Variabile `.env` | Descrizione |
+| --- | --- |
+| `DISCORD_TOKEN` | **(Obbligatorio)** Token del bot Discord |
+| `DISCORD_GUILD_ID` | *(Opzionale)* ID del server Discord per sincronizzare istantaneamente i comandi slash in un singolo server |
+| `PLEXCORD_ACTIVITY_PORT` | *(Opzionale)* Porta del server HTTP/WebSocket dell'Activity (predefinito: `8080`, `0` per disabilitare) |
+| `PLEXCORD_ACTIVITY_URL` | *(Opzionale)* URL pubblico HTTPS dell'Activity/Web Player |
+| `DISCORD_CLIENT_SECRET` | *(Opzionale)* Client Secret OAuth2 dell'app Discord per abilitare il Discord Rich Presence (RPC) personale (configurabile anche direttamente dentro l'Activity) |
+
+Avvia il container:
 
 ```sh
 docker compose up -d --build
 docker compose logs -f
 ```
 
-Non devi esporre porte del container: le connessioni sono in uscita. Consenti HTTPS verso Discord e Plex.tv, accesso al server Plex e traffico UDP in uscita per la voce Discord.
+---
 
-Senza `DISCORD_GUILD_ID` i comandi vengono pubblicati globalmente e possono impiegare tempo a comparire. Per cambiare modalità di pubblicazione in un bot già utilizzato, considera che i vecchi comandi globali/per-server possono rimanere registrati: non vengono cancellati automaticamente.
+## 3. Configura tutto da Discord (Comandi o Activity)
 
-## 3. Configura tutto da Discord
+Puoi configurare il server Plex sia tramite i comandi `/plex` (serve il permesso **Gestisci server**) sia direttamente dalla scheda **`⚙️ Config`** dentro la Discord Activity:
 
-Per `/plex` e `/settings` serve **Gestisci server**.
-
-1. `/plex login`: premi **Autorizza su Plex**, accedi nel browser e autorizza Plexcord. Torna su Discord e premi **Completa login** prima della scadenza.
-2. `/plex servers`: mostra i server e gli ID.
-3. `/plex server id:ID_SERVER`: verifica la connessione e seleziona il server. Tutte le librerie musicali vengono abilitate.
-4. `/plex libraries`: mostra nome, ID e stato delle librerie.
-5. Entra in un normale canale vocale e usa `/play query:titolo o autore`.
-
-Se ci sono più risultati, scegli dal menu privato. Usa **Avanti/Indietro** per scorrere pagine da 25 brani. Il menu dura 3 minuti; puoi restringere la ricerca passando `library:ID_LIBRERIA`. La ricerca è per **titolo del brano o nome dell'autore**, con un massimo di 200 risultati distribuiti tra le librerie e i titoli esatti in cima. Se la frase non trova un titolo esatto, il bot prova poche parole del titolo o dell'autore e confronta i candidati ignorando accenti, apostrofi, separatori e piccoli errori di battitura. Le ricerche rimangono limitate per evitare scansioni complete delle librerie: se manca un risultato, specifica un titolo più preciso e la libreria. Non carica automaticamente album o playlist.
-
-Prima di avviare la voce, il bot verifica che FFmpeg produca audio e seleziona esplicitamente la traccia audio (non la copertina incorporata). Se Plex contiene più versioni dello stesso brano, ignora quelle dichiarate non accessibili e prova le altre in caso di errore iniziale. Non riparte dall'inizio su un'altra versione se la riproduzione si interrompe a metà. I file realmente mancanti, corrotti o in un formato non decodificabile vanno comunque corretti sul server Plex.
-
-### Più librerie musicali
-
-```text
-/plex libraries
-/play query:Imagine
-/play query:Imagine library:2
-/plex library id:2 enabled:False
-/plex library id:2 enabled:True
-/plex all
-```
-
-Senza `library`, `/play` cerca in tutte le librerie abilitate. `/plex all` include automaticamente anche future librerie musicali. Quando personalizzi l'elenco con `/plex library`, nuove librerie non vengono incluse finché non le abiliti o ripristini `/plex all`.
-
-Cambiare login, server, indirizzo o abilitazione di una libreria interrompe la riproduzione e svuota la coda, per non conservare brani di una configurazione precedente. La selezione di un server nuovo ripristina tutte le librerie.
+1. **Collegamento Server Plex**:
+   - **Dall'Activity**: apri la scheda **⚙️ Config**, clicca **🔑 Collega con PIN a 4 Cifre**, copia il codice e incollalo su **https://plex.tv/link** (verifica automatica ogni 3 secondi).
+   - **Dai Comandi**: esegui `/plex login`, autorizza nel browser e premi **Completa login**.
+2. **Scelta del Server**:
+   - **Dall'Activity**: clicca **🔄 Carica Server**, scegli il server dal menu a tendina e premi **✅ Connetti**.
+   - **Dai Comandi**: usa `/plex servers` e `/plex server id:ID_SERVER` (con autocompletamento).
+3. **Librerie musicali**: tutte le librerie musicali vengono abilitate automaticamente; puoi abilitarle o disabilitarle singolarmente da **⚙️ Config** o con `/plex library`.
 
 ### Indirizzo Plex manuale
 
@@ -91,93 +96,88 @@ Se il rilevamento automatico non trova una connessione raggiungibile dal contain
 /plex server id:ID_SERVER
 ```
 
-Puoi impostare l'indirizzo anche prima di scegliere il server. Senza `url`, `/plex address` ripristina il rilevamento automatico.
-
 - `localhost` nel container indica **il container stesso**, non il PC o il NAS.
 - Su Docker Desktop, Plex sul PC host può essere raggiungibile tramite `http://host.docker.internal:32400`.
-- Se Plex è un altro container, usa una rete Docker condivisa e il nome del servizio Plex.
-- Sono accettati URL base HTTP/HTTPS senza credenziali, query o sottopercorsi. I reverse proxy devono esporre Plex alla radice.
-- I certificati HTTPS sono verificati; per un certificato privato configura una CA attendibile, non disabilitare TLS.
 - L'URL deve corrispondere al server Plex scelto: il bot verifica il `machineIdentifier` prima di salvare la connessione.
-- HTTP è adatto solo a reti fidate: il token Plex viaggia nell'header della richiesta.
 
-## Comandi
+---
+
+## 4. Discord Activity (Embedded App SDK), RPC Utente e Playlist
+
+### Configurazione dell'Activity nel Discord Developer Portal
+1. Esponi in HTTPS la porta `8080` del container (ad es. tramite reverse proxy o Cloudflare Tunnel).
+2. Nel [Discord Developer Portal](https://discord.com/developers/applications) della tua applicazione, apri **Activities → Settings** e abilita **Enable Activities**.
+3. In **Activities → URL Mappings**, imposta il prefisso `/` verso il tuo dominio HTTPS.
+4. *(Per il Discord Rich Presence personale)* In **OAuth2**:
+   - Aggiungi un **Redirect URL** (es. `https://127.0.0.1`).
+   - Copia il **Client Secret** e incollalo nella scheda **`🎧 RPC & Account`** dell'Activity (oppure in `DISCORD_CLIENT_SECRET` nel file `.env`).
+5. Nel canale vocale avvia l'Activity cliccando sull'icona del razzo 🚀 (**Avvia attività**) o usando `/activity`.
+
+### Collegamento Account Personale Plex e Playlist (`🎶 Playlist`)
+Ogni ascoltatore può collegare il proprio account Plex personale:
+1. Nella scheda **`🎧 RPC & Account`** dell'Activity (oppure eseguendo `/link`), genera il **codice PIN a 4 caratteri** e inseriscilo su **https://plex.tv/link**.
+2. Una volta collegato:
+   - La tua riproduzione su Discord apparirà in tempo reale sulla **Dashboard di Plex** con il tuo nome utente.
+   - Nella scheda **`🎶 Playlist`** dell'Activity (o con il comando `/playlist`) vedrai tutte le **tue playlist audio personali**, potrai aprirle per sfogliare i brani con copertina oppure riprodurle subito (`▶️ Ora`, `🔀 Shuffle`, `➕ Coda`).
+
+---
+
+## 5. Elenco Comandi Slash
 
 | Comando | Funzione |
 | --- | --- |
-| `/plex login` | Autorizzazione Plex |
-| `/plex logout` | Ferma il player e rimuove le credenziali locali |
-| `/plex servers` | Elenco dei server accessibili |
-| `/plex server id` | Selezione del server Plex |
-| `/plex address [url]` | Indirizzo manuale o automatico |
-| `/plex libraries` | Elenco delle librerie musicali |
-| `/plex library id enabled` | Abilita/disabilita una libreria |
-| `/plex all` | Abilita tutte le librerie, presenti e future |
-| `/settings` | Mostra la configurazione attuale |
-| `/settings volume bitrate idle_seconds max_queue dj_role clear_dj` | Modifica solo le opzioni fornite |
-| `/play query [library]` | Cerca un brano e lo mette in coda |
-| `/queue [page]` | Coda, 10 brani per pagina |
-| `/now` | Brano e progresso indicativo |
-| `/pause`, `/resume`, `/skip` | Controlli del brano |
-| `/shuffle` | Mescola solo i brani in attesa |
-| `/stop` | Ferma e svuota la coda; esce dopo il timeout |
-| `/leave` | Ferma, svuota ed esce subito |
-| `/help` | Guida rapida |
+| `/mode [modalita]` | Passa tra la **Modalità Activity** (`activity`) e la **Modalità Comandi Slash** (`commands`) |
+| `/activity` | Avvia la Discord Activity nel canale vocale o apre il Web Player interattivo |
+| `/play query [library]` | Cerca un brano per titolo o autore (con autocompletamento) e lo mette in coda |
+| `/playlist [id] [shuffle]` | Mostra e riproduce le playlist personali del tuo account Plex collegato |
+| `/link` | Collega il tuo account Plex personale a Discord tramite codice a 4 cifre (`plex.tv/link`) |
+| `/unlink` | Scollega il tuo account Plex personale dal tuo profilo Discord |
+| `/queue [page]` | Mostra il brano attuale, la coda (10 brani per pagina) e i pulsanti del player |
+| `/now` | Mostra il brano in corso, il progresso e i pulsanti di controllo |
+| `/pause`, `/resume`, `/skip` | Controlli rapidi del brano in riproduzione |
+| `/shuffle` | Mescola i brani in attesa nella coda |
+| `/stop` | Ferma la riproduzione e svuota la coda |
+| `/leave` | Ferma la riproduzione, svuota la coda ed esce subito dal canale vocale |
+| `/plex login`, `/plex logout` | Autorizzazione o rimozione dell'account Plex del server |
+| `/plex servers`, `/plex server id` | Elenco e selezione del server Plex (con autocompletamento) |
+| `/plex address [url]` | Imposta un indirizzo manuale LAN/Docker o ripristina il rilevamento automatico |
+| `/plex libraries`, `/plex library`, `/plex all` | Gestione delle librerie musicali abilitate |
+| `/settings [volume] [bitrate] [idle_seconds] [max_queue]` | Mostra o modifica volume (applicato istantaneamente), qualità Opus, timeout e limite coda |
+| `/help` | Guida rapida a tutti i comandi |
 
-Valori predefiniti: volume **100%**, Opus **128 kbps**, timeout a coda vuota **120 s**, massimo **100** brani in attesa. Volume e bitrate si applicano **dal prossimo brano**. Il timeout non interrompe un brano in pausa; usa `/stop` o `/leave`.
+Valori predefiniti: volume **100%** (modificabile da `0%` a `150%` in tempo reale senza interrompere il brano), Opus **128 kbps**, timeout a coda vuota **120 s**, massimo **100** brani in attesa.
 
-Chi controlla la musica deve essere nello stesso canale vocale del bot: **tutti gli utenti presenti nel canale vocale** possono riprodurre, scegliere i brani dal menu e controllare la riproduzione sia tramite i comandi slash sia tramite i **pulsanti interattivi del player** (`⏯️ Pausa/Riprendi`, `⏭️ Salta`, `🔀 Mescola`, `⏹️ Stop`, `👋 Esci`). `/queue` e `/now` sono consultabili anche fuori dal canale vocale.
+---
 
-## Persistenza e sicurezza
+## Persistenza e Sicurezza
 
-- Il volume Docker `plexcord-data` conserva impostazioni e token Plex in SQLite. **I token sono salvati in chiaro**, con permessi di file ristretti nel container: proteggi host, volume e backup. Non condividere il database.
-- Non vengono conservate password Plex. Token e link dei file non vengono mostrati nei messaggi Discord; FFmpeg riceve il token tramite header HTTP. Un amministratore dell'host può comunque leggere memoria e argomenti dei processi.
-- L'account Plex collegato è condiviso dal bot per **quel server Discord**, non per singolo ascoltatore. Abilita soltanto librerie che vuoi rendere disponibili agli utenti autorizzati.
-- `/plex logout` elimina le credenziali locali; per revocare l'accesso sull'account rimuovi Plexcord dai dispositivi autorizzati su Plex. Non invalida automaticamente token usati altrove.
-- Non pubblicare `.env`. Il token Discord resta fuori dal database.
-- Coda e riproduzione sono in memoria e **non riprendono dopo un riavvio**; il login e le impostazioni rimangono.
-- Un solo canale vocale e un solo server Plex selezionato per server Discord. Più server Discord possono avere configurazioni e player indipendenti.
+- Il volume Docker `plexcord-data` conserva impostazioni, collegamenti utenti e token in SQLite (`/app/data/plexcord.db`). Proteggi host, volume e backup.
+- Non vengono mai conservate password Plex. Token e URL interni dei file audio non vengono mai mostrati nei messaggi Discord né esposti al browser; le copertine vengono servite tramite proxy dal bot e FFmpeg riceve il token tramite header HTTP.
+- Usa il bot soltanto per contenuti che hai diritto di riprodurre/condividere.
 
-Usa il bot soltanto per contenuti che hai diritto di riprodurre/condividere.
+---
 
-## Gestione
+## Gestione e Sviluppo
 
 ```sh
+# Ricostruisci e avvia con Docker
+docker compose up -d --build
+
+# Riavvia o ferma
 docker compose restart
 docker compose down
-docker compose up -d --build
+
+# Monitora risorse
 docker stats
 ```
 
-`docker compose down` conserva il volume. **Non usare `down -v`** se vuoi mantenere credenziali e configurazione. Per aggiornare le dipendenze e ricostruire da zero: `docker compose build --no-cache`, poi `docker compose up -d`.
-
-### Problemi comuni
-
-- **Comandi non visibili:** controlla scope `applications.commands`, server corretto, permessi applicazione e propagazione dei comandi globali.
-- **Plex non raggiungibile:** imposta `/plex address` con un URL accessibile da Docker e controlla firewall, porta Plex e certificati. Se cambia l'IP del server, riselezionalo con `/plex server`.
-- **Accesso Plex negato:** ripeti `/plex login` e `/plex server`; verifica che l'account abbia accesso alle librerie.
-- **Connessione vocale fallita:** controlla Connect/Speak/View Channel e firewall UDP. I canali Stage non sono supportati.
-- **Il brano non viene trovato:** prova il titolo presente nei metadati Plex (non necessariamente il nome del file), specifica la libreria e scorri le pagine dei risultati.
-- **Il brano non parte:** verifica che il file sia online e accessibile tramite Plex e che FFmpeg supporti il formato. Il bot prova le versioni alternative disponibili prima di passare al prossimo brano; gli errori distinguono accesso negato, file non trovato, rete e decodifica senza esporre credenziali.
-
-## Sviluppo e test senza Docker
-
-Python 3.12+, FFmpeg nel PATH e dipendenze vocali. Il file `.env` viene letto da Compose, **non** dall'esecuzione Python diretta: esporta le variabili d'ambiente.
+### Esecuzione test automatici (senza Docker)
 
 ```sh
 python -m venv .venv
-# Attiva l'ambiente virtuale secondo il tuo sistema operativo.
+# Attiva l'ambiente virtuale
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
-python -m plexcord
 ```
 
-Esempio PowerShell prima dell'avvio diretto:
-
-```powershell
-$env:DISCORD_TOKEN = 'il_token_del_bot'
-$env:DISCORD_GUILD_ID = 'id_del_server_di_test'
-python -m plexcord
-```
-
-I test automatici usano HTTP locale e oggetti vocali simulati: non richiedono token reali. Se FFmpeg è nel PATH, eseguono anche una conversione audio HTTP → Opus reale; altrimenti quel test viene saltato. Non sostituiscono la verifica end-to-end su un server Plex e un canale vocale Discord reali.
+Per indicazioni sull'architettura interna e lo sviluppo assistito da AI, consulta [`AGENTS.md`](AGENTS.md).

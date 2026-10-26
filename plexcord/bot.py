@@ -6,9 +6,10 @@ import aiohttp
 import discord
 from discord import app_commands
 
+from .activity import ActivityServer
 from .player import Player
-from .plex import Plex, PlexError, Track, valid_url
-from .store import Store
+from .plex import Playlist, Plex, PlexError, Track, valid_url
+from .store import Store, UserLink
 
 
 def text(value: str, limit: int = 150) -> str:
@@ -31,10 +32,30 @@ async def reply(interaction, content, **kwargs):
 
 
 class Tree(app_commands.CommandTree):
+    async def sync(self, *, guild=None):
+        if guild is not None or not self.client.application_id:
+            return await super().sync(guild=guild)
+        commands = self._get_all_commands(guild=None)
+        payload = [command.to_dict(self) for command in commands]
+        with contextlib.suppress(discord.HTTPException):
+            existing = await self._http.get_global_commands(self.client.application_id)
+            payload.extend(cmd for cmd in existing if cmd.get("type") == 4)
+        return await self._http.bulk_upsert_global_commands(self.client.application_id, payload=payload)
+
     async def interaction_check(self, interaction):
         if not interaction.guild:
             await reply(interaction, "Usa i comandi all'interno di un server Discord, non in DM.")
             return False
+        cmd = interaction.command
+        root = cmd.root_parent.name if cmd and getattr(cmd, "root_parent", None) else (cmd.name if cmd else "")
+        if root and root not in ("mode", "activity", "link", "unlink", "leave", "help"):
+            settings = self.client.store.get(interaction.guild_id)
+            if settings.mode == "activity":
+                await self.client.send_activity_prompt(
+                    interaction,
+                    heading="🎛️ **Modalità Activity attiva:** usa l'Attività Discord o il Web Player qui sotto per cercare brani, gestire la coda e configurare Plex.\n*(Per tornare ai comandi slash classici usa `/mode`)*",
+                )
+                return False
         return True
 
     async def on_error(self, interaction, error):
@@ -99,6 +120,35 @@ class LoginView(OwnedView):
             await interaction.edit_original_response(content="✅ Login completato. Usa /plex servers e /plex server per scegliere il server.", view=None)
 
 
+class UserLinkView(OwnedView):
+    def __init__(self, bot, owner, pin_id, client_id, url, timeout):
+        super().__init__(owner, timeout)
+        self.bot = bot
+        self.pin_id = pin_id
+        self.client_id = client_id
+        self.add_item(discord.ui.Button(label="Apri plex.tv/link", url="https://plex.tv/link"))
+        self.add_item(discord.ui.Button(label="Link diretto", url=url))
+
+    @discord.ui.button(label="Completa collegamento", style=discord.ButtonStyle.success)
+    async def complete(self, interaction, button):
+        await interaction.response.defer(ephemeral=True)
+        token = await self.bot.plex.check_pin(self.pin_id, client_id=self.client_id)
+        if not token:
+            await reply(interaction, "Inserisci prima il codice a 4 caratteri su https://plex.tv/link, poi premi nuovamente **Completa collegamento**.")
+            return
+        plex_user = await self.bot.plex.user_info(token)
+        d_name = getattr(interaction.user, "display_name", None) or interaction.user.name
+        self.bot.store.save_user(UserLink(discord_id=interaction.user.id, plex_token=token, plex_username=plex_user, discord_name=d_name))
+        self.stop()
+        player = self.bot.players.get(interaction.guild_id)
+        if player and player.current:
+            asyncio.create_task(player.sync_timeline("paused" if player.paused_at else "playing", player.current))
+        await interaction.edit_original_response(
+            content=f"🎧 Account Plex **{text(plex_user)}** collegato al tuo profilo Discord! La tua attività di ascolto verrà mostrata su Plex e Discord.",
+            view=None,
+        )
+
+
 class VoiceView(discord.ui.View):
     """Menu e controlli utilizzabili da chiunque si trovi nel canale vocale."""
 
@@ -117,8 +167,12 @@ class VoiceView(discord.ui.View):
 
 
 class PlayerView(VoiceView):
-    def __init__(self, bot):
+    def __init__(self, bot, guild_id: int = 0, channel_id: int = 0):
         super().__init__(bot, timeout=600)
+        if bot and getattr(bot, "activity_url", "") and guild_id:
+            token = bot.activity_server.sign(guild_id, channel_id)
+            url = f"{bot.activity_url}/?guild_id={guild_id}&channel_id={channel_id}&token={token}"
+            self.add_item(discord.ui.Button(label="Web Player", emoji="🎛️", url=url, row=1))
 
     @discord.ui.button(label="Pausa/Riprendi", emoji="⏯️", style=discord.ButtonStyle.primary)
     async def toggle_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -234,7 +288,49 @@ class TrackView(VoiceView):
             self.stop()
             await interaction.edit_original_response(
                 content=f"✅ In coda: **{text(track.label)}** · {text(track.library)}",
-                view=PlayerView(self.bot),
+                view=self.bot.player_view(interaction),
+            )
+
+
+class PlaylistView(VoiceView):
+    def __init__(self, bot, playlists: list[Playlist], user_token: str, revision: int, shuffle: bool = False):
+        super().__init__(bot, timeout=180)
+        self.playlists = playlists[:25]
+        self.user_token = user_token
+        self.revision = revision
+        self.shuffle = shuffle
+        self.select = discord.ui.Select(
+            placeholder="Scegli una tua playlist Plex da riprodurre...",
+            options=[
+                discord.SelectOption(
+                    label=p.title[:100],
+                    value=p.id,
+                    description=f"{p.track_count} brani · {duration(p.duration // 1000)}"[:100],
+                )
+                for p in self.playlists
+            ],
+        )
+        self.select.callback = self.selected
+        self.add_item(self.select)
+
+    async def selected(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        async with self.bot.config_lock(interaction.guild_id):
+            settings = self.bot.store.get(interaction.guild_id)
+            if settings.revision != self.revision:
+                raise PlexError("Configurazione cambiata. Ripeti /playlist.")
+            channel = self.bot.require_voice(interaction)
+            pid = self.select.values[0]
+            pl = next((p for p in self.playlists if p.id == pid), None)
+            tracks = await self.bot.plex.playlist_tracks(settings, pid, user_token=self.user_token)
+            added = await self.bot.player(interaction.guild).add_many(
+                channel, tracks, interaction.channel, shuffle_tracks=self.shuffle
+            )
+            self.stop()
+            title = pl.title if pl else pid
+            await interaction.edit_original_response(
+                content=f"🎶 Aggiunti **{added} brani** dalla playlist **{text(title)}**!",
+                view=self.bot.player_view(interaction),
             )
 
 
@@ -250,19 +346,27 @@ class Plexcord(discord.Client):
         self.locks: dict[int, asyncio.Lock] = {}
         self.logins: dict[int, LoginView] = {}
         self.track_cache: dict[tuple[int, str], Track] = {}
+        port = int(os.environ.get("PLEXCORD_ACTIVITY_PORT", "8080") or "0")
+        self.activity_server = ActivityServer(self, port=port)
+        self.activity_url = os.environ.get("PLEXCORD_ACTIVITY_URL", "").strip().rstrip("/")
         self.http_session = None
         self.register_commands()
 
     async def setup_hook(self):
         self.http_session = aiohttp.ClientSession()
         self.plex = Plex(self.http_session, self.store.client_id)
-        guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
-        if guild_id:
-            guild = discord.Object(id=int(guild_id))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
+        await self.activity_server.start()
+        self.sync_task = asyncio.create_task(self.sync_commands())
+
+    async def sync_commands(self):
+        with contextlib.suppress(Exception):
+            guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
+            if guild_id:
+                guild = discord.Object(id=int(guild_id))
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+            else:
+                await self.tree.sync()
 
     async def on_ready(self):
         print(f"Plexcord connesso come {self.user} · {len(self.guilds)} server", flush=True)
@@ -272,8 +376,39 @@ class Plexcord(discord.Client):
 
     def player(self, guild):
         if guild.id not in self.players:
-            self.players[guild.id] = Player(guild, self.plex, self.store)
+            self.players[guild.id] = Player(guild, self.plex, self.store, bot=self)
         return self.players[guild.id]
+
+    def player_view(self, interaction):
+        voice = getattr(interaction.guild, "voice_client", None)
+        channel_id = voice.channel.id if voice and getattr(voice, "channel", None) else 0
+        if not channel_id and getattr(interaction.user, "voice", None) and interaction.user.voice.channel:
+            channel_id = interaction.user.voice.channel.id
+        return PlayerView(self, interaction.guild_id or 0, channel_id)
+
+    async def send_activity_prompt(self, interaction: discord.Interaction, heading: str = "🎛️ **Plexcord Activity & Web Player**"):
+        voice = getattr(interaction.guild, "voice_client", None)
+        channel = voice.channel if voice and getattr(voice, "channel", None) else None
+        if not channel and getattr(interaction.user, "voice", None) and interaction.user.voice.channel:
+            channel = interaction.user.voice.channel
+        channel_id = channel.id if channel else 0
+        token = self.activity_server.sign(interaction.guild_id, channel_id)
+        view = discord.ui.View(timeout=300)
+        lines = [heading]
+        if channel and self.application_id:
+            with contextlib.suppress(Exception):
+                invite = await channel.create_invite(
+                    max_age=3600,
+                    target_type=discord.InviteTarget.embedded_application,
+                    target_application_id=self.application_id,
+                )
+                view.add_item(discord.ui.Button(label="Avvia Discord Activity", emoji="🚀", url=invite.url))
+                lines.append("• Premi **Avvia Discord Activity** (oppure l'icona del razzo 🚀 nel canale vocale) per aprirla dentro Discord.")
+        base_url = self.activity_url or f"http://localhost:{self.activity_server.port}"
+        web_url = f"{base_url}/?guild_id={interaction.guild_id}&channel_id={channel_id}&token={token}"
+        view.add_item(discord.ui.Button(label="Apri Web Player", emoji="🌐", url=web_url))
+        lines.append("• Premi **Apri Web Player** per cercare brani, gestire coda, volume e configurazione dal browser.")
+        await reply(interaction, "\n".join(lines), view=view)
 
     async def disconnect(self, guild_id):
         if guild_id in self.players:
@@ -317,6 +452,7 @@ class Plexcord(discord.Client):
         for player in list(self.players.values()):
             with contextlib.suppress(Exception):
                 await player.close()
+        await self.activity_server.close()
         if self.http_session:
             await self.http_session.close()
         self.store.close()
@@ -478,7 +614,7 @@ class Plexcord(discord.Client):
         @app_commands.guild_only()
         @app_commands.default_permissions(manage_guild=True)
         @app_commands.checks.has_permissions(manage_guild=True)
-        @app_commands.describe(volume="0–150%, applicato dal prossimo brano", bitrate="Qualità Opus, kbps (prossimo brano)",
+        @app_commands.describe(volume="0–150%, applicato istantaneamente", bitrate="Qualità Opus, kbps (prossimo brano)",
                                idle_seconds="Secondi prima di uscire a coda vuota", max_queue="Massimo numero di brani in attesa",
                                dj_role="Ruolo DJ opzionale", clear_dj="Rimuove il ruolo DJ")
         async def settings_command(interaction: discord.Interaction,
@@ -502,11 +638,12 @@ class Plexcord(discord.Client):
                     changed = True
                 if changed:
                     self.store.save(interaction.guild_id, settings)
+                if volume is not None and interaction.guild_id in self.players:
+                    self.players[interaction.guild_id].set_volume(settings.volume)
             await reply(interaction, f"Server Plex: **{text(settings.server_name or 'non configurato')}**\n"
-                        f"Volume: {settings.volume}% · Opus: {settings.bitrate} kbps\n"
+                        f"Volume: {settings.volume}% (in tempo reale) · Opus: {settings.bitrate} kbps\n"
                         f"Uscita dopo: {settings.idle_seconds}s · Limite coda: {settings.max_queue}\n"
-                        "Controllo musica: tutti gli utenti presenti nel canale vocale.\n"
-                        "Volume e qualità si applicano dal prossimo brano.")
+                        "Controllo musica: tutti gli utenti presenti nel canale vocale.")
 
         @self.tree.command(name="play", description="Cerca un brano Plex per titolo o autore e aggiungilo alla coda")
         @app_commands.guild_only()
@@ -532,7 +669,7 @@ class Plexcord(discord.Client):
                         raise PlexError("Configurazione cambiata. Ripeti /play.")
                     await self.enqueue(interaction, tracks[0])
                 await reply(interaction, f"✅ In coda: **{text(tracks[0].label)}** · {text(tracks[0].library)}",
-                            view=PlayerView(self), ephemeral=False)
+                            view=self.player_view(interaction), ephemeral=False)
             else:
                 view = TrackView(self, interaction, tracks, settings.revision)
                 await reply(interaction, view.caption, view=view, ephemeral=False)
@@ -584,7 +721,7 @@ class Plexcord(discord.Client):
             await reply(
                 interaction,
                 f"**In riproduzione:** {current}\n**Coda:** {len(items)} brani · pagina {page}\n" + ("\n".join(lines) or "Nessun brano in questa pagina."),
-                view=PlayerView(self), ephemeral=False,
+                view=self.player_view(interaction), ephemeral=False,
             )
 
         @self.tree.command(name="now", description="Mostra brano, tempo di riproduzione e pulsanti di controllo")
@@ -600,7 +737,7 @@ class Plexcord(discord.Client):
                 interaction,
                 f"{state} **{text(track.label)}**\n{text(track.album)} · {text(track.library)}\n"
                 f"{duration(player.elapsed)} / {duration(track.duration // 1000)}",
-                view=PlayerView(self), ephemeral=False,
+                view=self.player_view(interaction), ephemeral=False,
             )
 
         # Comandi di controllo utilizzabili da chiunque si trovi nel canale vocale.
@@ -626,7 +763,7 @@ class Plexcord(discord.Client):
                             "stop": "⏹️ Riproduzione fermata e coda svuotata.", "shuffle": "🔀 Coda mescolata.",
                         }
                         message = messages[name]
-                view = None if name in ("stop", "leave") else PlayerView(self)
+                view = None if name in ("stop", "leave") else self.player_view(interaction)
                 await reply(interaction, message, view=view, ephemeral=False)
             control.__name__ = name
             self.tree.add_command(app_commands.guild_only()(app_commands.Command(name=name, description=description, callback=control)))
@@ -636,17 +773,133 @@ class Plexcord(discord.Client):
                                   ("leave", "Esce dal canale vocale"), ("shuffle", "Mescola i brani in attesa")):
             register_control(name, description)
 
+        @self.tree.command(name="activity", description="Avvia la Discord Activity (Embedded App SDK) o apre il Web Player nel canale vocale")
+        @app_commands.guild_only()
+        async def activity_command(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            self.require_voice(interaction)
+            await self.send_activity_prompt(interaction)
+
+        @self.tree.command(name="mode", description="Passa dalla modalità con i comandi slash alla modalità Activity (o viceversa)")
+        @app_commands.guild_only()
+        @app_commands.describe(modalita="Scegli la modalità (lascia vuoto per alternare tra Comandi e Activity)")
+        @app_commands.choices(modalita=[
+            app_commands.Choice(name="🎛️ Activity (Controlla e configura tutto dall'Attività)", value="activity"),
+            app_commands.Choice(name="💬 Comandi Slash (Modalità classica coi comandi)", value="commands"),
+        ])
+        async def mode_command(interaction: discord.Interaction, modalita: str | None = None):
+            await interaction.response.defer(ephemeral=False)
+            async with self.config_lock(interaction.guild_id):
+                settings = self.store.get(interaction.guild_id)
+                new_mode = modalita if modalita in ("activity", "commands") else ("activity" if settings.mode != "activity" else "commands")
+                settings.mode = new_mode
+                self.store.save(interaction.guild_id, settings)
+            if new_mode == "activity":
+                await self.send_activity_prompt(
+                    interaction,
+                    heading="✅ **Modalità Activity attivata!**\nOra puoi cercare canzoni, riprodurle subito o metterle in coda e configurare Plex direttamente dall'Attività.\n*(Usa `/mode` in qualsiasi momento per tornare ai comandi classici)*",
+                )
+            else:
+                await reply(
+                    interaction,
+                    "✅ **Modalità Comandi Slash attivata!**\nTutti i comandi classici (`/play`, `/plex`, `/settings`, `/queue`, ecc.) sono nuovamente attivi. Usa `/mode` per passare alla modalità Activity.",
+                    ephemeral=False,
+                )
+
+        @self.tree.command(name="link", description="Collega il tuo account Plex a Discord per mostrare la tua attività di ascolto su Plex e Discord")
+        @app_commands.guild_only()
+        @app_commands.checks.cooldown(1, 10, key=lambda i: i.user.id)
+        async def link_command(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            cid = f"{self.store.client_id}-u{interaction.user.id}"
+            pin_id, code, auth_url, expiry = await self.plex.pin_code(client_id=cid)
+            view = UserLinkView(self, interaction.user.id, pin_id, cid, auth_url, expiry)
+            existing = self.store.get_user(interaction.user.id)
+            status = f"\n*(Attualmente collegato a: **{text(existing.plex_username)}**)*" if existing and existing.plex_username else ""
+            await reply(
+                interaction,
+                f"🎧 **Collega il tuo Account Plex a Discord**{status}\n"
+                f"1. Vai su **https://plex.tv/link** e inserisci il codice PIN a 4 caratteri: **`{code}`**\n"
+                f"2. Torna qui e premi **Completa collegamento**.",
+                view=view,
+            )
+
+        @self.tree.command(name="playlist", description="Visualizza e riproduci le playlist del tuo account Plex collegato")
+        @app_commands.guild_only()
+        @app_commands.describe(id="Facoltativo: scegli una tua playlist Plex", shuffle="Mescola i brani della playlist")
+        async def playlist_command(interaction: discord.Interaction, id: str | None = None, shuffle: bool = False):
+            channel = self.require_voice(interaction)
+            link = self.store.get_user(interaction.user.id)
+            if not link or not link.plex_token:
+                raise PlexError("Collega prima il tuo account Plex con `/link` (o dalla scheda '🎧 RPC & Account' dell'Activity) per vedere le tue playlist personali.")
+            await interaction.response.defer(ephemeral=False)
+            settings = self.store.get(interaction.guild_id)
+            playlists = await self.plex.playlists(settings, user_token=link.plex_token)
+            if not playlists:
+                await reply(interaction, f"Nessuna playlist audio trovata per l'account Plex **{text(link.plex_username)}**.", ephemeral=False)
+                return
+            if id:
+                pl = next((p for p in playlists if p.id == id or p.title.casefold() == id.strip().casefold()), None)
+                if not pl:
+                    raise PlexError("Playlist non trovata. Sceglila dall'elenco di `/playlist`.")
+                async with self.config_lock(interaction.guild_id):
+                    tracks = await self.plex.playlist_tracks(settings, pl.id, user_token=link.plex_token)
+                    added = await self.player(interaction.guild).add_many(
+                        channel, tracks, interaction.channel, shuffle_tracks=shuffle
+                    )
+                await reply(
+                    interaction,
+                    f"🎶 Aggiunti **{added} brani** dalla tua playlist **{text(pl.title)}**!",
+                    view=self.player_view(interaction),
+                    ephemeral=False,
+                )
+            else:
+                view = PlaylistView(self, playlists, link.plex_token, settings.revision, shuffle=shuffle)
+                await reply(
+                    interaction,
+                    f"🎶 **Playlist di {text(link.plex_username)}** ({len(playlists)} trovate):",
+                    view=view,
+                    ephemeral=False,
+                )
+
+        @playlist_command.autocomplete("id")
+        async def playlist_autocomplete(interaction: discord.Interaction, current: str):
+            with contextlib.suppress(Exception):
+                link = self.store.get_user(interaction.user.id)
+                if not link or not link.plex_token:
+                    return []
+                settings = self.store.get(interaction.guild_id)
+                playlists = await self.plex.playlists(settings, user_token=link.plex_token)
+                needle = current.casefold()
+                return [
+                    app_commands.Choice(name=f"{p.title} ({p.track_count} brani)"[:100], value=p.id[:100])
+                    for p in playlists
+                    if not needle or needle in p.title.casefold()
+                ][:25]
+            return []
+
+        @self.tree.command(name="unlink", description="Scollega il tuo account personale Plex dal tuo profilo Discord")
+        @app_commands.guild_only()
+        async def unlink_command(interaction: discord.Interaction):
+            self.store.delete_user(interaction.user.id)
+            await reply(interaction, "🗑️ Il tuo account Plex è stato scollegato dal profilo Discord.")
+
         @self.tree.command(name="help", description="Guida rapida ai comandi Plexcord")
         @app_commands.guild_only()
         async def help_command(interaction: discord.Interaction):
-            await reply(interaction, "**Configurazione (Gestisci server)**\n"
+            await reply(interaction, "**Modalità, Activity, Playlist e Sincronizzazione Ascolto**\n"
+                        "`/mode`: passa tra la **Modalità Comandi** e la **Modalità Activity** (dove puoi cercare, vedere le tue playlist, riprodurre e configurare tutto dall'interfaccia grafica).\n"
+                        "`/activity`: apre la Discord Activity o il Web Player.\n"
+                        "`/link` · `/unlink`: collega il tuo account Plex personale a Discord (con codice a 4 cifre su `plex.tv/link`) per mostrare l'attività di ascolto su Plex/Discord e accedere alle tue playlist.\n"
+                        "`/playlist`: mostra e riproduce le playlist personali del tuo account Plex collegato.\n\n"
+                        "**Configurazione (Gestisci server o da Activity)**\n"
                         "/plex login → /plex servers → /plex server → /plex libraries\n"
                         "/plex address: URL LAN/Docker opzionale\n/plex library: abilita/disabilita librerie · /plex all: tutte\n"
-                        "/settings: volume, bitrate, timeout e limite coda\n/plex logout: scollega Plex\n\n"
+                        "/settings: volume (in tempo reale), bitrate, timeout e limite coda\n/plex logout: scollega Plex\n\n"
                         "**Musica (per tutti nel canale vocale)**\n"
-                        "Entra nel canale vocale e usa `/play query` (cerca per titolo o autore, con suggerimenti automatici).\n"
+                        "Entra nel canale vocale e usa `/play query` (cerca per titolo o autore), `/playlist` o `/activity`.\n"
                         "Usa i **pulsanti sotto al player** (⏯️ ⏭️ 🔀 ⏹️ 👋) oppure i comandi:\n"
-                        "/now · /queue [page] · /pause · /resume · /skip · /shuffle · /stop · /leave")
+                        "/mode · /activity · /link · /playlist · /now · /queue [page] · /pause · /resume · /skip · /shuffle · /stop · /leave")
 
     @staticmethod
     async def send_lines(interaction, heading, lines):

@@ -20,7 +20,16 @@ class Settings:
     idle_seconds: int = 120
     max_queue: int = 100
     dj_role: int | None = None
+    mode: str = "commands"
     revision: int = 0
+
+
+@dataclass
+class UserLink:
+    discord_id: int
+    plex_token: str = field(default="", repr=False)
+    plex_username: str = ""
+    discord_name: str = ""
 
 
 class Store:
@@ -31,6 +40,7 @@ class Store:
         os.chmod(path / "plexcord.sqlite3", 0o600)
         self.db.execute("PRAGMA secure_delete=ON")
         self.db.execute("CREATE TABLE IF NOT EXISTS settings (guild INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS user_links (discord_id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.db.execute("INSERT OR IGNORE INTO meta VALUES ('client_id', ?)", (str(uuid.uuid4()),))
         self.db.commit()
@@ -43,6 +53,34 @@ class Store:
     def save(self, guild: int, settings: Settings):
         settings.revision += 1
         self.db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (guild, json.dumps(asdict(settings))))
+        self.db.commit()
+
+    def get_user(self, discord_id: int) -> UserLink | None:
+        row = self.db.execute("SELECT data FROM user_links WHERE discord_id=?", (discord_id,)).fetchone()
+        return UserLink(**json.loads(row[0])) if row else None
+
+    def save_user(self, link: UserLink):
+        self.db.execute("INSERT OR REPLACE INTO user_links VALUES (?, ?)", (link.discord_id, json.dumps(asdict(link))))
+        self.db.commit()
+
+    def delete_user(self, discord_id: int):
+        self.db.execute("DELETE FROM user_links WHERE discord_id=?", (discord_id,))
+        self.db.commit()
+
+    def list_users(self, discord_ids: list[int] | None = None) -> list[UserLink]:
+        rows = self.db.execute("SELECT data FROM user_links").fetchall()
+        links = [UserLink(**json.loads(r[0])) for r in rows]
+        if discord_ids is not None:
+            wanted = set(discord_ids)
+            return [u for u in links if u.discord_id in wanted]
+        return links
+
+    def get_meta(self, key: str, default: str = "") -> str:
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_meta(self, key: str, value: str):
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
         self.db.commit()
 
     def close(self):

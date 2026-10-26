@@ -63,6 +63,14 @@ class Library:
 
 
 @dataclass(frozen=True)
+class Playlist:
+    id: str
+    title: str
+    track_count: int
+    duration: int
+
+
+@dataclass(frozen=True)
 class Track:
     id: str
     title: str
@@ -80,7 +88,13 @@ class Plex:
     def __init__(self, session: aiohttp.ClientSession, client_id: str):
         self.session = session
         self.client_id = client_id
-        self.limit = asyncio.Semaphore(4)
+        self.limit = asyncio.Semaphore(6)
+        self.art_limit = asyncio.Semaphore(8)
+        self.thumbs: dict[str, str] = {}
+        self.thumb_tokens: dict[str, str] = {}
+        self.art_by_thumb: dict[tuple[str, str], tuple[bytes, str]] = {}
+        self.art_inflight: dict[tuple[str, str], asyncio.Future] = {}
+        self.user_srv_tokens: dict[tuple[str, str], str] = {}
 
     def headers(self, token: str = "", json: bool = False):
         headers = {
@@ -126,9 +140,49 @@ class Plex:
         query = urlencode({"clientID": self.client_id, "code": pin["code"], "context[device][product]": "Plexcord"})
         return pin["id"], f"https://app.plex.tv/auth#?{query}", min(int(pin.get("expiresIn", 300)), 600)
 
-    async def check_pin(self, pin_id):
-        data = await self.request(f"https://plex.tv/api/v2/pins/{pin_id}", json=True)
-        return data.get("authToken")
+    async def pin_code(self, client_id: str | None = None):
+        cid = client_id or self.client_id
+        headers = self.headers(json=True)
+        headers["X-Plex-Client-Identifier"] = cid
+        try:
+            async with self.limit:
+                async with self.session.post(
+                    "https://plex.tv/api/v2/pins", headers=headers,
+                    allow_redirects=False, timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
+                    if response.status >= 300:
+                        raise PlexError(f"Plex ha risposto con HTTP {response.status}.")
+                    import json as json_module
+                    pin = json_module.loads(await response.read())
+        except PlexError:
+            raise
+        except Exception:
+            raise PlexError("Impossibile generare il codice PIN su Plex.") from None
+        code = str(pin.get("code", "")).upper()
+        query = urlencode({"clientID": cid, "code": code, "context[device][product]": "Plexcord"})
+        return pin["id"], code, f"https://app.plex.tv/auth#?{query}", min(int(pin.get("expiresIn", 900)), 900)
+
+    async def check_pin(self, pin_id, client_id: str | None = None):
+        cid = client_id or self.client_id
+        headers = self.headers(json=True)
+        headers["X-Plex-Client-Identifier"] = cid
+        try:
+            async with self.limit:
+                async with self.session.get(
+                    f"https://plex.tv/api/v2/pins/{pin_id}", headers=headers,
+                    allow_redirects=False, timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
+                    if response.status >= 300:
+                        return None
+                    import json as json_module
+                    data = json_module.loads(await response.read())
+                    return data.get("authToken")
+        except Exception:
+            return None
+
+    async def user_info(self, token: str) -> str:
+        data = await self.request("https://plex.tv/api/v2/user", token, json=True)
+        return str(data.get("username") or data.get("title") or data.get("email") or "Utente Plex")
 
     async def resources(self, token):
         data = await self.request("https://plex.tv/api/v2/resources", token, params={"includeHttps": "1", "includeRelay": "1"}, json=True)
@@ -242,6 +296,16 @@ class Plex:
                     if not key.isdigit() or key in found:
                         continue
                     added += 1
+                    thumb = (
+                        t.get("thumb") or t.get("parentThumb") or t.get("grandparentThumb")
+                        or t.get("art") or t.get("parentArt") or t.get("grandparentArt") or ""
+                    )
+                    if thumb:
+                        self.thumbs[key] = thumb
+                        if len(self.thumbs) > 5000:
+                            old_k = next(iter(self.thumbs))
+                            self.thumbs.pop(old_k, None)
+                            self.thumb_tokens.pop(old_k, None)
                     found[key] = Track(key, t.get("title") or "Senza titolo",
                                        t.get("originalTitle") or t.get("grandparentTitle") or "Artista sconosciuto",
                                        t.get("parentTitle") or "", lib.title, number(t.get("duration")))
@@ -360,3 +424,293 @@ class Plex:
         if not urls:
             raise PlexError("Nessun file audio accessibile per questo brano. Verifica il file e i permessi sul server Plex.")
         return urls[:8]
+
+    async def resolve_user_token(self, settings: Settings, user_token: str = "") -> str:
+        self.ready(settings)
+        if not user_token or user_token == settings.server_token or user_token == settings.token:
+            return settings.server_token
+        key = (settings.server_id or settings.server_url, user_token)
+        if key in self.user_srv_tokens:
+            return self.user_srv_tokens[key]
+        resolved = user_token
+        if settings.server_id:
+            try:
+                resources = await self.resources(user_token)
+                resource = next((r for r in resources if r.get("clientIdentifier") == settings.server_id), None)
+                if resource and resource.get("accessToken"):
+                    resolved = resource["accessToken"]
+            except Exception:
+                pass
+        self.user_srv_tokens[key] = resolved
+        if len(self.user_srv_tokens) > 100:
+            self.user_srv_tokens.pop(next(iter(self.user_srv_tokens)))
+        return resolved
+
+    async def playlists(self, settings: Settings, user_token: str = "") -> list[Playlist]:
+        self.ready(settings)
+        token = await self.resolve_user_token(settings, user_token)
+        try:
+            root = await self.request(
+                f"{settings.server_url}/playlists", token,
+                params={"playlistType": "audio"},
+            )
+        except PlexError:
+            if token != settings.server_token:
+                root = await self.request(
+                    f"{settings.server_url}/playlists", settings.server_token,
+                    params={"playlistType": "audio"},
+                )
+            else:
+                raise
+        items: list[Playlist] = []
+        for p in root.findall("Playlist"):
+            key = p.get("ratingKey", "")
+            if not key.isdigit() or p.get("playlistType", "audio") != "audio":
+                continue
+            thumb = p.get("composite") or p.get("thumb") or p.get("art") or ""
+            if thumb:
+                pl_key = f"pl_{key}"
+                self.thumbs[pl_key] = thumb
+                self.thumb_tokens[pl_key] = token
+                if len(self.thumbs) > 5000:
+                    old_k = next(iter(self.thumbs))
+                    self.thumbs.pop(old_k, None)
+                    self.thumb_tokens.pop(old_k, None)
+            items.append(
+                Playlist(
+                    id=key,
+                    title=p.get("title") or "Playlist senza titolo",
+                    track_count=number(p.get("leafCount")),
+                    duration=number(p.get("duration")),
+                )
+            )
+        return items
+
+    async def playlist_tracks(self, settings: Settings, playlist_id: str, user_token: str = "") -> list[Track]:
+        self.ready(settings)
+        pid = str(playlist_id).strip()
+        if not pid.isdigit():
+            raise PlexError("ID playlist non valido.")
+        token = await self.resolve_user_token(settings, user_token)
+        params = {"X-Plex-Container-Start": "0", "X-Plex-Container-Size": str(SEARCH_LIMIT)}
+        try:
+            root = await self.request(f"{settings.server_url}/playlists/{pid}/items", token, params=params)
+        except PlexError:
+            if token != settings.server_token:
+                root = await self.request(f"{settings.server_url}/playlists/{pid}/items", settings.server_token, params=params)
+            else:
+                raise
+        tracks: list[Track] = []
+        for t in root.findall("Track"):
+            key = t.get("ratingKey", "")
+            if not key.isdigit():
+                continue
+            thumb = (
+                t.get("thumb") or t.get("parentThumb") or t.get("grandparentThumb")
+                or t.get("art") or t.get("parentArt") or t.get("grandparentArt") or ""
+            )
+            if thumb:
+                self.thumbs[key] = thumb
+                self.thumb_tokens[key] = token
+                if f"pl_{pid}" not in self.thumbs:
+                    self.thumbs[f"pl_{pid}"] = thumb
+                    self.thumb_tokens[f"pl_{pid}"] = token
+                if len(self.thumbs) > 5000:
+                    old_k = next(iter(self.thumbs))
+                    self.thumbs.pop(old_k, None)
+                    self.thumb_tokens.pop(old_k, None)
+            tracks.append(
+                Track(
+                    key,
+                    t.get("title") or "Senza titolo",
+                    t.get("originalTitle") or t.get("grandparentTitle") or "Artista sconosciuto",
+                    t.get("parentTitle") or "",
+                    t.get("librarySectionTitle") or "Playlist",
+                    number(t.get("duration")),
+                )
+            )
+        return tracks[:SEARCH_LIMIT]
+
+    async def _playlist_first_track_thumb(self, settings: Settings, pid: str, token: str) -> str:
+        params = {"X-Plex-Container-Start": "0", "X-Plex-Container-Size": "1"}
+        for tok in dict.fromkeys((token, settings.server_token)):
+            if not tok:
+                continue
+            try:
+                root = await self.request(f"{settings.server_url}/playlists/{pid}/items", tok, params=params)
+                t = root.find("Track")
+                if t is not None:
+                    th = (
+                        t.get("thumb") or t.get("parentThumb") or t.get("grandparentThumb")
+                        or t.get("art") or t.get("parentArt") or t.get("grandparentArt") or ""
+                    )
+                    if th:
+                        return th
+            except Exception:
+                continue
+        return ""
+
+    async def artwork(self, settings: Settings, track_id: str) -> tuple[bytes, str] | None:
+        self.ready(settings)
+        is_playlist = track_id.startswith("pl_") and track_id[3:].isdigit()
+        if not track_id.isdigit() and not is_playlist:
+            return None
+        art_token = self.thumb_tokens.get(track_id) or settings.server_token
+        thumb = self.thumbs.get(track_id, "")
+        if not thumb and track_id.isdigit():
+            try:
+                root = await self.request(f"{settings.server_url}/library/metadata/{track_id}", art_token)
+            except PlexError:
+                if art_token != settings.server_token:
+                    root = await self.request(f"{settings.server_url}/library/metadata/{track_id}", settings.server_token)
+                else:
+                    return None
+            track = root.find("Track")
+            if track is None:
+                return None
+            thumb = (
+                track.get("thumb") or track.get("parentThumb") or track.get("grandparentThumb")
+                or track.get("art") or track.get("parentArt") or track.get("grandparentArt") or ""
+            )
+            if thumb:
+                self.thumbs[track_id] = thumb
+        elif not thumb and is_playlist:
+            pid = track_id[3:]
+            try:
+                root = await self.request(f"{settings.server_url}/playlists/{pid}", art_token)
+                pl_node = root.find("Playlist")
+                if pl_node is not None:
+                    thumb = pl_node.get("composite") or pl_node.get("thumb") or pl_node.get("art") or ""
+            except Exception:
+                thumb = ""
+            if not thumb:
+                thumb = await self._playlist_first_track_thumb(settings, pid, art_token)
+            if thumb:
+                self.thumbs[track_id] = thumb
+
+        async def _download_thumb(raw_thumb: str) -> tuple[bytes, str] | None:
+            if not raw_thumb:
+                return None
+            try:
+                parsed = urlsplit(raw_thumb)
+            except ValueError:
+                return None
+            path = unquote(parsed.path)
+            if (parsed.scheme or parsed.netloc or parsed.fragment
+                    or not path.startswith(("/library/", "/playlists/", "/photo/"))
+                    or ".." in path.split("/") or any(c in unquote(raw_thumb) for c in ("\r", "\n", "\\"))):
+                return None
+            cache_key = (settings.server_url, path)
+            if cache_key in self.art_by_thumb:
+                return self.art_by_thumb[cache_key]
+            inflight = self.art_inflight.get(cache_key)
+            if inflight is not None:
+                return await asyncio.shield(inflight)
+
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future[tuple[bytes, str] | None] = loop.create_future()
+            self.art_inflight[cache_key] = fut
+            url = settings.server_url + quote(parsed.path, safe="/%:@")
+            params = {"width": "240", "height": "240"} if "/composite/" in path else None
+
+            async def _fetch_once(tok: str) -> tuple[bytes, str] | None:
+                hdrs = self.headers(tok)
+                hdrs["Accept"] = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+                async with self.art_limit:
+                    async with self.session.get(
+                        url, headers=hdrs, params=params,
+                        allow_redirects=False, timeout=aiohttp.ClientTimeout(total=12),
+                    ) as response:
+                        if response.status >= 300:
+                            return None
+                        body = bytearray()
+                        async for chunk in response.content.iter_chunked(65536):
+                            body.extend(chunk)
+                            if len(body) > 10 * 1024 * 1024:
+                                return None
+                        if not body:
+                            return None
+                        content_type = response.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+                        if not content_type.startswith("image/"):
+                            content_type = "image/jpeg"
+                        return (bytes(body), content_type)
+
+            try:
+                res = await _fetch_once(art_token)
+                if res is None and art_token != settings.server_token:
+                    res = await _fetch_once(settings.server_token)
+                if res is not None:
+                    self.art_by_thumb[cache_key] = res
+                    if len(self.art_by_thumb) > 250:
+                        self.art_by_thumb.pop(next(iter(self.art_by_thumb)))
+                if not fut.done():
+                    fut.set_result(res)
+                return res
+            except Exception:
+                if not fut.done():
+                    fut.set_result(None)
+                return None
+            finally:
+                self.art_inflight.pop(cache_key, None)
+
+        result = await _download_thumb(thumb)
+        if result is None and is_playlist:
+            fallback_thumb = await self._playlist_first_track_thumb(settings, track_id[3:], art_token)
+            if fallback_thumb and fallback_thumb != thumb:
+                self.thumbs[track_id] = fallback_thumb
+                result = await _download_thumb(fallback_thumb)
+        return result
+
+    async def report_timeline(
+        self,
+        settings: Settings,
+        track: Track,
+        state: str,
+        elapsed_ms: int,
+        *,
+        user_token: str = "",
+        client_id: str = "",
+        device_name: str = "Discord",
+    ):
+        if not settings.server_url or not settings.server_token or not track or not track.id.isdigit():
+            return
+        token = user_token or settings.server_token
+        headers = {
+            "Accept": "application/xml",
+            "X-Plex-Client-Identifier": client_id or self.client_id,
+            "X-Plex-Product": "Plexcord",
+            "X-Plex-Version": "1.0",
+            "X-Plex-Platform": "Discord",
+            "X-Plex-Device": "Discord",
+            "X-Plex-Device-Name": device_name[:60],
+            "X-Plex-Provides": "player,controller",
+            "X-Plex-Token": token,
+        }
+        params = {
+            "ratingKey": str(track.id),
+            "key": f"/library/metadata/{track.id}",
+            "containerKey": f"/library/metadata/{track.id}",
+            "playQueueItemID": "1",
+            "state": state,
+            "time": str(max(0, int(elapsed_ms))),
+            "playbackTime": str(max(0, int(elapsed_ms))),
+            "duration": str(max(1000, int(track.duration or 1000))),
+            "hasMDE": "1",
+        }
+        url = f"{settings.server_url}/:/timeline"
+        try:
+            async with self.limit:
+                async with self.session.get(
+                    url, headers=headers, params=params,
+                    allow_redirects=False, timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    await resp.read()
+                    if resp.status in (401, 403) and user_token and user_token != settings.server_token:
+                        headers["X-Plex-Token"] = settings.server_token
+                        async with self.session.get(
+                            url, headers=headers, params=params,
+                            allow_redirects=False, timeout=aiohttp.ClientTimeout(total=8),
+                        ) as fallback_resp:
+                            await fallback_resp.read()
+        except Exception:
+            pass

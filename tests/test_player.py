@@ -139,3 +139,38 @@ class PlayerTests(unittest.IsolatedAsyncioTestCase):
             await self.wait_for(lambda: self.player.current is None)
             self.assertIsNone(self.voice.source)
             audio.return_value.cleanup.assert_called_once()
+
+    async def test_seek_remove_and_promote(self):
+        with patch("plexcord.player.ManagedOpusAudio") as audio:
+            audio.return_value.prepare = AsyncMock()
+            track2 = Track("2", "Second", "Artist", "Album", "Music", 120000)
+            track3 = Track("3", "Third", "Artist", "Album", "Music", 120000)
+            await self.player.add(self.voice.channel, self.track, None)
+            await self.wait_for(lambda: self.voice.source is not None)
+            await self.player.add(self.voice.channel, track2, None)
+            await self.player.add(self.voice.channel, track3, None)
+
+            promoted = self.player.promote(1, play_now=False)
+            self.assertEqual(promoted.id, "3")
+            self.assertEqual(self.player.queue[0].id, "3")
+
+            removed = self.player.remove(1)
+            self.assertEqual(removed.id, "2")
+            self.assertEqual(len(self.player.queue), 1)
+
+            self.player.promote(0, play_now=True)
+            await self.wait_for(lambda: audio.call_count == 2)
+            self.assertEqual(self.player.current.id, "3")
+
+            self.player.seek(30)
+            await self.wait_for(lambda: audio.call_count == 3)
+            self.assertIn("-ss 30", audio.call_args.kwargs["before_options"])
+            self.assertGreaterEqual(self.player.elapsed, 30)
+
+            self.player.set_volume(65)
+            self.assertAlmostEqual(self.voice.source.volume, 0.65)
+            self.assertEqual(audio.call_count, 3)
+
+            added = await self.player.add_many(self.voice.channel, [track2, track3], None, play_now=False)
+            self.assertEqual(added, 2)
+            self.assertEqual(len(self.player.queue), 2)

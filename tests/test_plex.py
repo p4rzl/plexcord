@@ -207,6 +207,38 @@ class PlexTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(PlexError, "accessibile"):
             await self.plex.streams(self.settings, Track("1", "Song", "", "", "", 0))
 
+    async def test_playlists_and_playlist_tracks(self):
+        async def request(url, token="", *args, **kwargs):
+            if url.endswith("/playlists"):
+                return ElementTree.fromstring(
+                    '<MediaContainer>'
+                    '<Playlist ratingKey="101" title="My Mix" playlistType="audio" leafCount="2" duration="300000" composite="/playlists/101/composite/1"/>'
+                    '<Playlist ratingKey="102" title="Video List" playlistType="video" leafCount="5" duration="900000"/>'
+                    '</MediaContainer>'
+                )
+            if url.endswith("/playlists/101/items"):
+                return ElementTree.fromstring(
+                    '<MediaContainer>'
+                    '<Track ratingKey="55" title="Track One" grandparentTitle="Artist A" parentTitle="Album A" librarySectionTitle="Music" duration="150000" thumb="/library/metadata/55/thumb/1"/>'
+                    '<Track ratingKey="56" title="Track Two" originalTitle="Artist B" parentTitle="Album B" duration="150000"/>'
+                    '</MediaContainer>'
+                )
+            return ElementTree.fromstring('<MediaContainer/>')
+
+        self.plex.request = AsyncMock(side_effect=request)
+        playlists = await self.plex.playlists(self.settings, user_token="user-tok")
+        self.assertEqual(len(playlists), 1)
+        self.assertEqual(playlists[0].id, "101")
+        self.assertEqual(playlists[0].title, "My Mix")
+        self.assertEqual(playlists[0].track_count, 2)
+        self.assertEqual(self.plex.thumbs.get("pl_101"), "/playlists/101/composite/1")
+
+        tracks = await self.plex.playlist_tracks(self.settings, "101", user_token="user-tok")
+        self.assertEqual([t.id for t in tracks], ["55", "56"])
+        self.assertEqual(tracks[0].artist, "Artist A")
+        self.assertEqual(tracks[1].artist, "Artist B")
+        self.assertEqual(self.plex.thumbs.get("55"), "/library/metadata/55/thumb/1")
+
     async def test_http_chunking_headers_and_sanitized_errors(self):
         received = []
 
