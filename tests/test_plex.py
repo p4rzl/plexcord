@@ -272,3 +272,53 @@ class PlexTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("secret", str(error.exception))
         finally:
             await runner.cleanup()
+
+    async def test_resolve_user_token_and_report_timeline(self):
+        settings = Settings(server_url="http://127.0.0.1", server_token="admin-srv-tok", server_id="srv-123", token="admin-cloud-tok")
+        self.plex.resources = AsyncMock(return_value=[
+            {"clientIdentifier": "srv-123", "accessToken": "user-scoped-srv-tok"}
+        ])
+        resolved = await self.plex.resolve_user_token(settings, user_token="friend-cloud-tok", username="kikmine")
+        self.assertEqual(resolved, "user-scoped-srv-tok")
+
+        # Test shared servers fallback
+        self.plex.resources = AsyncMock(return_value=[])
+        async def shared_req(url, token="", *args, **kwargs):
+            if "shared_servers" in url:
+                return ElementTree.fromstring(
+                    '<MediaContainer>'
+                    '<SharedServer username="blackdevilwe" accessToken="blackdevilwe-srv-tok"/>'
+                    '</MediaContainer>'
+                )
+            return ElementTree.fromstring('<MediaContainer/>')
+        self.plex.request = AsyncMock(side_effect=shared_req)
+        resolved_shared = await self.plex.resolve_user_token(settings, user_token="blackdevilwe-cloud-tok", username="Blackdevilwe")
+        self.assertEqual(resolved_shared, "blackdevilwe-srv-tok")
+
+        # Test report_timeline uses user-specific token and does NOT fall back to admin token
+        timeline_headers = []
+        async def timeline_handler(request):
+            timeline_headers.append(dict(request.headers))
+            return web.Response(status=200, text="<Response/>")
+
+        app = web.Application()
+        app.router.add_get("/:/timeline", timeline_handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        settings.server_url = f"http://127.0.0.1:{port}"
+
+        try:
+            track = Track("42", "Song", "Artist", "Album", "Music", 180000)
+            await self.plex.report_timeline(
+                settings, track, "playing", 15000,
+                user_token="blackdevilwe-cloud-tok", username="Blackdevilwe",
+                client_id="client-1", device_name="Discord (Blackdevilwe)",
+            )
+            self.assertEqual(len(timeline_headers), 1)
+            self.assertEqual(timeline_headers[0]["X-Plex-Token"], "blackdevilwe-srv-tok")
+            self.assertEqual(timeline_headers[0]["X-Plex-Device-Name"], "Discord (Blackdevilwe)")
+        finally:
+            await runner.cleanup()

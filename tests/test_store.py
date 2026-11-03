@@ -13,9 +13,11 @@ class StoreTests(unittest.TestCase):
             settings.token = "secret"
             settings.libraries = []
             settings.volume = 75
+            settings.language = "it"
             store.save(1, settings)
             self.assertEqual(settings.revision, 1)
             self.assertEqual(store.get(2).token, "")
+            self.assertEqual(store.get(2).language, "en")
             self.assertIsNone(store.get(2).libraries)
             self.assertNotIn("secret", repr(settings))
             store.close()
@@ -24,4 +26,5 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(store.get(1).token, "secret")
             self.assertEqual(store.get(1).volume, 75)
             self.assertEqual(store.get(1).libraries, [])
+            self.assertEqual(store.get(1).language, "it")
             store.close()

@@ -170,6 +170,7 @@ class Player:
         self.task: asyncio.Task | None = None
         self.text_channel = None
         self.last_discord_state: tuple[str, str] = ("", "")
+        self.reported_listener_ids: set[int] = set()
 
     async def _ensure_voice(self, channel):
         voice = self.guild.voice_client
@@ -313,10 +314,14 @@ class Player:
         for m in getattr(channel, "members", []) or []:
             if not getattr(m, "bot", False):
                 ids.add(m.id)
-        return self.store.list_users(list(ids))
+        return [u for u in self.store.list_users(list(ids)) if u.plex_token]
 
     async def sync_timeline(self, state: str, track: Track | None = None):
         t = track or self.current
+        presence = getattr(self.bot, "presence", None) if self.bot else None
+        if presence is not None and hasattr(presence, "notify"):
+            # Rich Presence personale di tutti gli ascoltatori autorizzati (non bloccante).
+            presence.notify(self, state)
         discord_key = (state, t.id if t else "")
         if self.bot and discord_key != self.last_discord_state:
             self.last_discord_state = discord_key
@@ -349,12 +354,15 @@ class Player:
         settings = self.store.get(self.guild.id)
         elapsed_ms = self.elapsed * 1000
         listeners = self.active_listeners()
+        current_listener_ids = set()
         if listeners:
             for link in listeners:
+                current_listener_ids.add(link.discord_id)
                 name = link.plex_username or link.discord_name or f"Utente {link.discord_id}"
                 await self.plex.report_timeline(
                     settings, t, state, elapsed_ms,
                     user_token=link.plex_token,
+                    username=link.plex_username,
                     client_id=f"{self.store.client_id}-u{link.discord_id}",
                     device_name=f"Discord ({name})",
                 )
@@ -363,6 +371,21 @@ class Player:
                 settings, t, state, elapsed_ms,
                 device_name=f"Discord ({getattr(self.guild, 'name', 'Plexcord')})",
             )
+
+        # Se qualche ascoltatore ha lasciato il canale, invia lo stop a Plex per chiudere la sua sessione
+        left_ids = self.reported_listener_ids - current_listener_ids
+        for uid in left_ids:
+            old_link = self.store.get_user(uid)
+            old_token = old_link.plex_token if old_link else ""
+            old_name = (old_link.plex_username or old_link.discord_name) if old_link else ""
+            await self.plex.report_timeline(
+                settings, t, "stopped", elapsed_ms,
+                user_token=old_token,
+                username=old_name,
+                client_id=f"{self.store.client_id}-u{uid}",
+                device_name=f"Discord ({old_name or 'Utente'})",
+            )
+        self.reported_listener_ids = current_listener_ids if state != "stopped" else set()
 
     @property
     def elapsed(self):

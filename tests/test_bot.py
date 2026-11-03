@@ -55,9 +55,21 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
             class FakeMember(discord.Member):
                 def __init__(self, user_id, voice_channel):
-                    self.id = user_id
-                    self.voice = SimpleNamespace(channel=voice_channel) if voice_channel else None
-                    self.roles = []
+                    self._user_id = user_id
+                    self._voice_channel = voice_channel
+                    self._roles = []
+
+                @property
+                def id(self):
+                    return self._user_id
+
+                @property
+                def voice(self):
+                    return SimpleNamespace(channel=self._voice_channel) if self._voice_channel else None
+
+                @property
+                def roles(self):
+                    return self._roles
 
             member_in_voice = FakeMember.__new__(FakeMember)
             FakeMember.__init__(member_in_voice, 42, channel)
@@ -98,5 +110,159 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 bad_request = SimpleNamespace(query={"token": "1:10:9999999999:invalid"})
                 with self.assertRaises(PlexError):
                     bot.activity_server.resolve_context(bad_request)
+            finally:
+                await bot.close()
+
+    async def test_dj_only_permission_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = Plexcord(directory)
+            channel = SimpleNamespace(id=10)
+            dj_role = SimpleNamespace(id=777, name="DJ", position=2, is_default=lambda: False, managed=False)
+            guild = SimpleNamespace(
+                id=1,
+                owner_id=500,
+                voice_client=SimpleNamespace(channel=channel),
+                get_role=lambda rid: dj_role if rid == 777 else None,
+                roles=[dj_role],
+            )
+
+            class FakeMember(discord.Member):
+                def __init__(self, user_id, voice_channel, roles=None, manage_guild=False, administrator=False):
+                    self._user_id = user_id
+                    self._voice_channel = voice_channel
+                    self._roles = roles or []
+                    self._guild_perms = SimpleNamespace(manage_guild=manage_guild, administrator=administrator)
+
+                @property
+                def id(self):
+                    return self._user_id
+
+                @property
+                def voice(self):
+                    return SimpleNamespace(channel=self._voice_channel) if self._voice_channel else None
+
+                @property
+                def roles(self):
+                    return self._roles
+
+                @property
+                def guild_permissions(self):
+                    return self._guild_perms
+
+            user_normal = FakeMember.__new__(FakeMember)
+            FakeMember.__init__(user_normal, 100, channel)
+
+            user_admin = FakeMember.__new__(FakeMember)
+            FakeMember.__init__(user_admin, 200, channel, manage_guild=True)
+
+            user_dj = FakeMember.__new__(FakeMember)
+            FakeMember.__init__(user_dj, 300, channel, roles=[dj_role])
+
+            user_owner = FakeMember.__new__(FakeMember)
+            FakeMember.__init__(user_owner, 500, channel)
+
+            # Quando dj_only è False: chiunque può controllare
+            settings = bot.store.get(1)
+            settings.dj_only = False
+            bot.store.save(1, settings)
+            self.assertTrue(bot.can_control(guild, user_normal, settings))
+            self.assertTrue(bot.can_control(guild, user_admin, settings))
+
+            # Quando dj_only è True: solo admin, owner o ruolo DJ
+            settings.dj_only = True
+            settings.dj_role = 777
+            bot.store.save(1, settings)
+
+            self.assertFalse(bot.can_control(guild, user_normal, settings))
+            self.assertTrue(bot.can_control(guild, user_admin, settings))
+            self.assertTrue(bot.can_control(guild, user_dj, settings))
+            self.assertTrue(bot.can_control(guild, user_owner, settings))
+
+            # Verifica require_voice e PlayerView con dj_only
+            interaction_normal = SimpleNamespace(user=user_normal, guild=guild, guild_id=1)
+            interaction_dj = SimpleNamespace(user=user_dj, guild=guild, guild_id=1)
+
+            with self.assertRaises(PlexError) as ctx:
+                bot.require_voice(interaction_normal)
+            self.assertIn("@DJ", str(ctx.exception))
+
+            self.assertIs(bot.require_voice(interaction_dj), channel)
+
+            player_view = PlayerView(bot)
+            try:
+                with self.assertRaises(PlexError):
+                    await player_view.interaction_check(interaction_normal)
+                self.assertTrue(await player_view.interaction_check(interaction_dj))
+            finally:
+                player_view.stop()
+                await bot.close()
+
+    async def test_activity_permissions_and_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = Plexcord(directory)
+            channel = SimpleNamespace(id=10, members=[SimpleNamespace(bot=False, id=100)])
+            dj_role = SimpleNamespace(id=888, name="MusicMaster", position=5, is_default=lambda: False, managed=False)
+            guild = SimpleNamespace(
+                id=1,
+                voice_client=SimpleNamespace(channel=channel),
+                get_channel=lambda cid: channel if cid == 10 else None,
+                get_role=lambda rid: dj_role if rid == 888 else None,
+                voice_channels=[channel],
+                roles=[dj_role],
+            )
+            bot.get_guild = lambda gid: guild if gid == 1 else None
+
+            settings = bot.store.get(1)
+            settings.dj_only = True
+            settings.dj_role = 888
+            bot.store.save(1, settings)
+
+            try:
+                state = await bot.activity_server.build_state(guild, channel)
+                self.assertTrue(state["dj_only"])
+                self.assertEqual(state["dj_role"], "888")
+                self.assertEqual(state["dj_role_name"], "MusicMaster")
+                self.assertEqual(state["language"], "en")
+                self.assertEqual(len(state["roles"]), 1)
+                self.assertEqual(state["roles"][0]["name"], "MusicMaster")
+
+                # Test config_handler save_settings aggiorna dj_only, dj_role e lingua
+                req = SimpleNamespace(
+                    query={"guild_id": "1", "channel_id": "10"},
+                    match_info={},
+                    json=AsyncMock(return_value={"action": "save_settings", "dj_only": True, "dj_role": "888", "language": "it"})
+                )
+                await bot.activity_server.config_handler(req)
+                saved = bot.store.get(1)
+                self.assertTrue(saved.dj_only)
+                self.assertEqual(saved.dj_role, 888)
+                self.assertEqual(saved.language, "it")
+
+                # Test control_handler blocca utenti non DJ se dj_only è attivo
+                guild.get_member = lambda uid: SimpleNamespace(id=uid, guild_permissions=SimpleNamespace(manage_guild=False, administrator=False), roles=[])
+                ctrl_req = SimpleNamespace(
+                    query={"guild_id": "1", "channel_id": "10"},
+                    match_info={},
+                    json=AsyncMock(return_value={"action": "skip", "user_id": "999"})
+                )
+                ctrl_res = await bot.activity_server.control_handler(ctrl_req)
+                self.assertEqual(ctrl_res.status, 400)
+            finally:
+                await bot.close()
+
+    async def test_activity_asset_handlers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bot = Plexcord(directory)
+            try:
+                req = SimpleNamespace()
+                res_logo = await bot.activity_server.logo_handler(req)
+                self.assertEqual(res_logo.status, 200)
+                self.assertEqual(res_logo.content_type, "image/jpeg")
+                self.assertTrue(len(res_logo.body) > 0)
+
+                res_banner = await bot.activity_server.banner_handler(req)
+                self.assertEqual(res_banner.status, 200)
+                self.assertEqual(res_banner.content_type, "image/jpeg")
+                self.assertTrue(len(res_banner.body) > 0)
             finally:
                 await bot.close()

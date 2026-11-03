@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -95,6 +97,7 @@ class Plex:
         self.art_by_thumb: dict[tuple[str, str], tuple[bytes, str]] = {}
         self.art_inflight: dict[tuple[str, str], asyncio.Future] = {}
         self.user_srv_tokens: dict[tuple[str, str], str] = {}
+        self.shared_tokens_cache: dict[str, tuple[float, dict[str, str]]] = {}
 
     def headers(self, token: str = "", json: bool = False):
         headers = {
@@ -425,14 +428,49 @@ class Plex:
             raise PlexError("Nessun file audio accessibile per questo brano. Verifica il file e i permessi sul server Plex.")
         return urls[:8]
 
-    async def resolve_user_token(self, settings: Settings, user_token: str = "") -> str:
+    async def shared_server_tokens(self, settings: Settings) -> dict[str, str]:
+        """Recupera la mappa {username_o_email: accessToken} degli utenti condivisi dal server Plex."""
+        if not settings.token or not settings.server_id:
+            return {}
+        now = time.monotonic()
+        cached = self.shared_tokens_cache.get(settings.server_id)
+        if cached and (now - cached[0]) < 300:
+            return cached[1]
+        tokens: dict[str, str] = {}
+        try:
+            root = await self.request(
+                f"https://plex.tv/api/servers/{settings.server_id}/shared_servers",
+                settings.token,
+            )
+            for s in root.findall("SharedServer"):
+                tok = s.get("accessToken", "")
+                if not tok:
+                    continue
+                username = s.get("username", "")
+                email = s.get("email", "")
+                user_id = s.get("userID", "")
+                if username:
+                    tokens[username.casefold()] = tok
+                if email:
+                    tokens[email.casefold()] = tok
+                if user_id:
+                    tokens[str(user_id)] = tok
+        except Exception:
+            pass
+        self.shared_tokens_cache[settings.server_id] = (now, tokens)
+        return tokens
+
+    async def resolve_user_token(self, settings: Settings, user_token: str = "", username: str = "") -> str:
         self.ready(settings)
-        if not user_token or user_token == settings.server_token or user_token == settings.token:
+        if not user_token:
+            return ""
+        if user_token == settings.server_token or user_token == settings.token:
             return settings.server_token
         key = (settings.server_id or settings.server_url, user_token)
         if key in self.user_srv_tokens:
             return self.user_srv_tokens[key]
-        resolved = user_token
+        resolved = ""
+        # 1. Prova a ricavare l'accessToken del server dalle resources personali dell'utente
         if settings.server_id:
             try:
                 resources = await self.resources(user_token)
@@ -441,8 +479,20 @@ class Plex:
                     resolved = resource["accessToken"]
             except Exception:
                 pass
+        # 2. Se non trovato e abbiamo lo username, cerca nei server condivisi registrati dall'admin
+        if not resolved and settings.server_id:
+            user_name = username
+            if not user_name:
+                with contextlib.suppress(Exception):
+                    user_name = await self.user_info(user_token)
+            if user_name:
+                shared = await self.shared_server_tokens(settings)
+                resolved = shared.get(user_name.casefold(), "")
+        # 3. Se ancora non risolto, usa user_token come fallback diretto
+        if not resolved:
+            resolved = user_token
         self.user_srv_tokens[key] = resolved
-        if len(self.user_srv_tokens) > 100:
+        if len(self.user_srv_tokens) > 200:
             self.user_srv_tokens.pop(next(iter(self.user_srv_tokens)))
         return resolved
 
@@ -669,12 +719,19 @@ class Plex:
         elapsed_ms: int,
         *,
         user_token: str = "",
+        username: str = "",
         client_id: str = "",
         device_name: str = "Discord",
     ):
         if not settings.server_url or not settings.server_token or not track or not track.id.isdigit():
             return
-        token = user_token or settings.server_token
+        if user_token:
+            token = await self.resolve_user_token(settings, user_token, username=username)
+            if not token:
+                return
+        else:
+            token = settings.server_token
+
         headers = {
             "Accept": "application/xml",
             "X-Plex-Client-Identifier": client_id or self.client_id,
@@ -705,12 +762,5 @@ class Plex:
                     allow_redirects=False, timeout=aiohttp.ClientTimeout(total=8),
                 ) as resp:
                     await resp.read()
-                    if resp.status in (401, 403) and user_token and user_token != settings.server_token:
-                        headers["X-Plex-Token"] = settings.server_token
-                        async with self.session.get(
-                            url, headers=headers, params=params,
-                            allow_redirects=False, timeout=aiohttp.ClientTimeout(total=8),
-                        ) as fallback_resp:
-                            await fallback_resp.read()
         except Exception:
             pass

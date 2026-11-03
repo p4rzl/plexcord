@@ -20,6 +20,8 @@ class Settings:
     idle_seconds: int = 120
     max_queue: int = 100
     dj_role: int | None = None
+    dj_only: bool = False
+    language: str = "en"
     mode: str = "commands"
     revision: int = 0
 
@@ -42,13 +44,22 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS settings (guild INTEGER PRIMARY KEY, data TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS user_links (discord_id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        # Token OAuth2 Discord per singolo utente (Rich Presence). Mai esposti nei log.
+        self.db.execute("CREATE TABLE IF NOT EXISTS discord_oauth (discord_id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
         self.db.execute("INSERT OR IGNORE INTO meta VALUES ('client_id', ?)", (str(uuid.uuid4()),))
         self.db.commit()
         self.client_id = self.db.execute("SELECT value FROM meta WHERE key='client_id'").fetchone()[0]
 
     def get(self, guild: int) -> Settings:
         row = self.db.execute("SELECT data FROM settings WHERE guild=?", (guild,)).fetchone()
-        return Settings(**json.loads(row[0])) if row else Settings()
+        if not row:
+            return Settings()
+        try:
+            data = json.loads(row[0])
+            fields = {f.name for f in Settings.__dataclass_fields__.values()}
+            return Settings(**{k: v for k, v in data.items() if k in fields})
+        except Exception:
+            return Settings()
 
     def save(self, guild: int, settings: Settings):
         settings.revision += 1
@@ -82,6 +93,31 @@ class Store:
     def set_meta(self, key: str, value: str):
         self.db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
         self.db.commit()
+
+    def get_discord_oauth(self, discord_id: int) -> dict | None:
+        row = self.db.execute("SELECT data FROM discord_oauth WHERE discord_id=?", (discord_id,)).fetchone()
+        if not row:
+            return None
+        try:
+            data = json.loads(row[0])
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def save_discord_oauth(self, discord_id: int, data: dict):
+        self.db.execute("INSERT OR REPLACE INTO discord_oauth VALUES (?, ?)", (discord_id, json.dumps(data)))
+        self.db.commit()
+
+    def delete_discord_oauth(self, discord_id: int):
+        self.db.execute("DELETE FROM discord_oauth WHERE discord_id=?", (discord_id,))
+        self.db.commit()
+
+    def discord_oauth_ids(self, discord_ids: list[int] | None = None) -> list[int]:
+        ids = [r[0] for r in self.db.execute("SELECT discord_id FROM discord_oauth").fetchall()]
+        if discord_ids is not None:
+            wanted = set(discord_ids)
+            return [i for i in ids if i in wanted]
+        return ids
 
     def close(self):
         self.db.close()
