@@ -1453,14 +1453,13 @@ async function authorizeDiscordRpc(interactive = false) {
       return;
     }
 
-    let authRes = null;
-    const base = ["identify", "rpc.activities.write"];
-    try {
-      // activities.write abilita lo stato "sempre attivo" anche ad Activity chiusa.
-      authRes = await rpcCall("AUTHORIZE", {client_id: clientId, response_type: "code", state: "", prompt: "none", scope: [...base, "activities.write"]});
-    } catch {
-      authRes = await rpcCall("AUTHORIZE", {client_id: clientId, response_type: "code", state: "", prompt: "none", scope: base});
-    }
+    const authRes = await rpcCall("AUTHORIZE", {
+      client_id: clientId,
+      response_type: "code",
+      state: "",
+      prompt: "none",
+      scope: ["identify", "rpc.activities.write"]
+    });
     if (!authRes || !authRes.code) throw new Error("Codice OAuth2 non ricevuto");
     const res = await tokenApi({action: "exchange", code: authRes.code});
     if (!res.ok || !res.data.access_token) throw new Error(res.data.error || "Scambio token Discord fallito");
@@ -1520,6 +1519,19 @@ function initDiscordSdk() {
     if (p.cmd === "DISPATCH" && p.evt === "READY") {
       sdkReady = true;
       document.getElementById("sdk-status").textContent = t("sdk_status_act");
+      if (p.data && p.data.user) {
+        discordUser = p.data.user;
+        const uSel = document.getElementById("user-sel");
+        if (uSel) {
+          if (![...uSel.options].some(o => o.value === String(discordUser.id))) {
+            const o = document.createElement("option");
+            o.value = String(discordUser.id);
+            o.textContent = discordUser.global_name || discordUser.username || String(discordUser.id);
+            uSel.appendChild(o);
+          }
+          uSel.value = String(discordUser.id);
+        }
+      }
       rpcCall("SUBSCRIBE", {evt: "ACTIVITY_LAYOUT_MODE_UPDATE"}).catch(() => {});
       rpcCall("SUBSCRIBE", {evt: "ACTIVITY_PIP_MODE_UPDATE"}).catch(() => {});
       setTimeout(() => authorizeDiscordRpc(false), 300);
@@ -1548,18 +1560,8 @@ let lastPresenceStartSec = 0;
 let lastPresenceSentAt = 0;
 let presenceTimer = null;
 
-let clientPresenceCleared = false;
 function updateDiscordActivityPresence(force = false) {
   if (!sdkReady || !rpcAuthed || !stateLoaded) return;
-  if (serverPresenceActive()) {
-    // Lo stato è già pubblicato dal server per tutti gli ascoltatori autorizzati: evita duplicati.
-    if (!clientPresenceCleared) {
-      clientPresenceCleared = true;
-      rpcCall("SET_ACTIVITY", {activity: null}).catch(() => {});
-    }
-    return;
-  }
-  if (clientPresenceCleared) { clientPresenceCleared = false; force = true; }
   const cur = state.current;
   const nowMs = Date.now();
   const nowSec = Math.floor(nowMs / 1000);
@@ -1568,31 +1570,25 @@ function updateDiscordActivityPresence(force = false) {
     if (lastPresenceKey === "idle" && !force) return;
     lastPresenceKey = "idle";
     lastPresenceTrackId = "";
-    const idleAct = {
-      type: 2,
-      details: padRpcStr("In attesa di un brano", "Plexcord"),
-      state: padRpcStr("Plexcord · " + (state.server_name || "Plex"), "Plex")
-    };
-    rpcCall("SET_ACTIVITY", {activity: idleAct}).catch(() => {
-      rpcCall("SET_ACTIVITY", {activity: {...idleAct, type: 0}}).catch(() => {});
-    });
+    lastPresencePaused = false;
+    rpcCall("SET_ACTIVITY", {activity: null}).catch(() => {});
     return;
   }
 
   const durSec = Math.floor((cur.duration || 0) / 1000);
-  const elSec = Math.max(0, Math.min(durSec || (state.elapsed || 0), state.elapsed || 0));
+  const elSec = Math.max(0, Math.min(durSec || Math.floor(state.elapsed || 0), Math.floor(state.elapsed || 0)));
   const computedStartSec = nowSec - elSec;
   const trackChanged = cur.id !== lastPresenceTrackId;
   const pauseChanged = Boolean(state.paused) !== lastPresencePaused;
-  const seeked = !state.paused && Math.abs(computedStartSec - lastPresenceStartSec) >= 6;
+  const seeked = !state.paused && Math.abs(computedStartSec - lastPresenceStartSec) >= 5;
 
   if (!force && !trackChanged && !pauseChanged && !seeked) return;
 
   // Rispetta il rate-limit RPC di Discord evitando invii ravvicinati
   const elapsedSinceLast = nowMs - lastPresenceSentAt;
-  if (!force && !trackChanged && elapsedSinceLast < 4000) {
+  if (!force && !trackChanged && elapsedSinceLast < 3000) {
     clearTimeout(presenceTimer);
-    presenceTimer = setTimeout(() => updateDiscordActivityPresence(true), 4000 - elapsedSinceLast);
+    presenceTimer = setTimeout(() => updateDiscordActivityPresence(true), 3000 - elapsedSinceLast);
     return;
   }
 
@@ -1602,19 +1598,18 @@ function updateDiscordActivityPresence(force = false) {
   lastPresenceStartSec = computedStartSec;
   lastPresenceSentAt = nowMs;
 
-  const detailsStr = padRpcStr((state.paused ? "⏸️ " : "🎵 ") + cur.title, "Brano su Plex");
-  const stateStr = padRpcStr("di " + cur.artist + (cur.album ? " · " + cur.album : ""), "Artista");
+  const titleStr = padRpcStr(cur.title, "Plexcord");
+  const artistAlbum = cur.artist + (cur.album ? " · " + cur.album : "");
+  const stateStr = padRpcStr(state.paused ? "⏸️ " + artistAlbum : artistAlbum, "Plex");
   const actObj = {
     type: 2,
-    details: detailsStr,
+    details: titleStr,
     state: stateStr
   };
   if (!state.paused && durSec > 0) {
-    const startMs = nowMs - (elSec * 1000);
-    const endMs = startMs + Math.max(1000, durSec * 1000);
     actObj.timestamps = {
-      start: startMs,
-      end: endMs
+      start: computedStartSec,
+      end: computedStartSec + durSec
     };
   }
   rpcCall("SET_ACTIVITY", {activity: actObj}).catch(() => {
@@ -1944,17 +1939,17 @@ function render(st) {
           <div class="item-meta"><span class="pill-dur">${fmt((cur.duration || 0) / 1000)}</span><span>${t("queue_now_playing_badge")}</span></div>
         </div>
       </div>` : "";
-    qEl.innerHTML = nowRow + (q.length ? q.map((t, i) => `
+    qEl.innerHTML = nowRow + (q.length ? q.map((trk, i) => `
       <div class="item" style="--i:${i}">
-        <div class="item-thumb" data-art="${esc(artUrlFor(t.id))}">
+        <div class="item-thumb" data-art="${esc(artUrlFor(trk.id))}">
           <svg viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6Z"/></svg>
         </div>
         <div class="item-info">
-          <div class="item-title">${i + 1}. ${esc(t.title)}</div>
-          <div class="item-artist">${esc(t.artist)}</div>
+          <div class="item-title">${i + 1}. ${esc(trk.title)}</div>
+          <div class="item-artist">${esc(trk.artist)}</div>
           <div class="item-meta">
-            <span class="pill-dur">${fmt((t.duration || 0) / 1000)}</span>
-            <span>${esc(t.album || t.library)}</span>
+            <span class="pill-dur">${fmt((trk.duration || 0) / 1000)}</span>
+            <span>${esc(trk.album || trk.library)}</span>
           </div>
         </div>
         <div class="item-actions">
@@ -2272,27 +2267,27 @@ async function openPlaylist(pl) {
       return;
     }
     playlistTracks = data.tracks || [];
-    list.innerHTML = playlistTracks.length ? playlistTracks.map((t, i) => `
-      <div class="item${state.current && state.current.id === t.id ? ' is-current' : ''}" style="--i:${i}">
-        <div class="item-thumb" data-art="${esc(artUrlFor(t.id))}" data-play="1" data-ptact="now" data-idx="${i}" title="Riproduci subito">
+    list.innerHTML = playlistTracks.length ? playlistTracks.map((trk, i) => `
+      <div class="item${state.current && state.current.id === trk.id ? ' is-current' : ''}" style="--i:${i}">
+        <div class="item-thumb" data-art="${esc(artUrlFor(trk.id))}" data-play="1" data-ptact="now" data-idx="${i}" title="${t("btn_now")}">
           <svg viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6Z"/></svg>
         </div>
         <div class="item-info">
-          <div class="item-title">${i + 1}. ${esc(t.title)}</div>
-          <div class="item-artist">${esc(t.artist)}</div>
+          <div class="item-title">${i + 1}. ${esc(trk.title)}</div>
+          <div class="item-artist">${esc(trk.artist)}</div>
           <div class="item-meta">
-            <span class="pill-dur">${fmt((t.duration || 0) / 1000)}</span>
-            <span>${esc(t.album || t.library)}</span>
+            <span class="pill-dur">${fmt((trk.duration || 0) / 1000)}</span>
+            <span>${esc(trk.album || trk.library)}</span>
           </div>
         </div>
         <div class="item-actions">
-          <button type="button" class="ok" data-ptact="now" data-idx="${i}" title="Riproduci subito">▶ <span class="lbl-hide-xs">Ora</span></button>
-          <button type="button" class="primary" data-ptact="queue" data-idx="${i}" title="Aggiungi alla coda">+ <span class="lbl-hide-xs">Coda</span></button>
+          <button type="button" class="ok" data-ptact="now" data-idx="${i}" title="${t("btn_now")}">▶ <span class="lbl-hide-xs">${t("btn_now")}</span></button>
+          <button type="button" class="primary" data-ptact="queue" data-idx="${i}" title="${t("btn_queue")}">+ <span class="lbl-hide-xs">${t("btn_queue")}</span></button>
         </div>
-      </div>`).join("") : '<div class="empty-state"><div class="empty-sub">Questa playlist è vuota.</div></div>';
+      </div>`).join("") : `<div class="empty-state"><div class="empty-sub">${t("pl_empty_playlist")}</div></div>`;
     hydrateThumbs(list);
   } catch {
-    list.innerHTML = '<div class="empty-state"><div class="empty-sub">⚠️ Errore di rete.</div></div>';
+    list.innerHTML = `<div class="empty-state"><div class="empty-sub">${t("toast_net_err")}</div></div>`;
   }
 }
 
@@ -2366,17 +2361,17 @@ async function doSearch() {
       return;
     }
     searchResults = data.tracks || [];
-    list.innerHTML = searchResults.length ? searchResults.map((t, i) => `
-      <div class="item${state.current && state.current.id === t.id ? ' is-current' : ''}" style="--i:${i}">
-        <div class="item-thumb" data-art="${esc(artUrlFor(t.id))}" data-play="1" data-sact="now" data-idx="${i}" title="${t("btn_now")}">
+    list.innerHTML = searchResults.length ? searchResults.map((trk, i) => `
+      <div class="item${state.current && state.current.id === trk.id ? ' is-current' : ''}" style="--i:${i}">
+        <div class="item-thumb" data-art="${esc(artUrlFor(trk.id))}" data-play="1" data-sact="now" data-idx="${i}" title="${t("btn_now")}">
           <svg viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6Z"/></svg>
         </div>
         <div class="item-info">
-          <div class="item-title">${esc(t.title)}</div>
-          <div class="item-artist">${esc(t.artist)}</div>
+          <div class="item-title">${esc(trk.title)}</div>
+          <div class="item-artist">${esc(trk.artist)}</div>
           <div class="item-meta">
-            <span class="pill-dur">${fmt((t.duration || 0) / 1000)}</span>
-            <span>${esc(t.album ? t.album + ' · ' + t.library : t.library)}</span>
+            <span class="pill-dur">${fmt((trk.duration || 0) / 1000)}</span>
+            <span>${esc(trk.album ? trk.album + ' · ' + trk.library : trk.library)}</span>
           </div>
         </div>
         <div class="item-actions">
@@ -2977,11 +2972,21 @@ class ActivityServer:
             settings = self.bot.store.get(guild.id)
             if settings.dj_only:
                 raw_uid = str(data.get("user_id") or request.query.get("user_id") or "").strip()
-                member = guild.get_member(int(raw_uid)) if raw_uid.isdigit() and hasattr(guild, "get_member") else None
-                if not member and raw_uid.isdigit() and hasattr(guild, "fetch_member"):
-                    with contextlib.suppress(Exception):
-                        member = await guild.fetch_member(int(raw_uid))
-                if not member or not self.bot.can_control(guild, member, settings):
+                member = None
+                if raw_uid.isdigit():
+                    uid_int = int(raw_uid)
+                    if channel and hasattr(channel, "members"):
+                        for m in channel.members:
+                            if getattr(m, "id", None) == uid_int:
+                                member = m
+                                break
+                    if not member and hasattr(guild, "get_member"):
+                        member = guild.get_member(uid_int)
+                    if not member and hasattr(guild, "fetch_member"):
+                        with contextlib.suppress(Exception):
+                            member = await guild.fetch_member(uid_int)
+                is_owner = raw_uid.isdigit() and int(raw_uid) == getattr(guild, "owner_id", None)
+                if not is_owner and not self.bot.can_control(guild, member, settings):
                     dj_role_obj = guild.get_role(settings.dj_role) if settings.dj_role and hasattr(guild, "get_role") else None
                     role_hint = f" o il ruolo @{dj_role_obj.name}" if dj_role_obj else ""
                     raise PlexError(f"I controlli della musica sono riservati: serve il permesso Gestisci Server{role_hint}.")
@@ -3082,15 +3087,24 @@ class ActivityServer:
                     "plex_logout", "plex_server", "plex_address", "plex_all_libraries",
                     "plex_library", "save_settings",
                 }
-                if action in admin_actions and settings.dj_only:
+                if action in admin_actions:
                     raw_uid = str(data.get("user_id") or request.query.get("user_id") or "").strip()
                     if raw_uid.isdigit():
-                        member = guild.get_member(int(raw_uid)) if hasattr(guild, "get_member") else None
+                        uid_int = int(raw_uid)
+                        member = None
+                        if channel and hasattr(channel, "members"):
+                            for m in channel.members:
+                                if getattr(m, "id", None) == uid_int:
+                                    member = m
+                                    break
+                        if not member and hasattr(guild, "get_member"):
+                            member = guild.get_member(uid_int)
                         if not member and hasattr(guild, "fetch_member"):
                             with contextlib.suppress(Exception):
-                                member = await guild.fetch_member(int(raw_uid))
-                        if member and not self.bot.can_control(guild, member, settings):
-                            raise PlexError("Solo gli amministratori (o utenti autorizzati) possono modificare la configurazione.")
+                                member = await guild.fetch_member(uid_int)
+                        is_owner = int(raw_uid) == getattr(guild, "owner_id", None)
+                        if not is_owner and not self.bot.is_admin(guild, member):
+                            raise PlexError("Solo gli amministratori (Gestisci Server) possono modificare la configurazione.")
                 if action == "set_mode":
                     mode = str(data.get("mode", "commands"))
                     if mode not in ("commands", "activity"):

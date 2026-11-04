@@ -734,6 +734,15 @@ class Plexcord(discord.Client):
         if guild_id in self.players:
             await self.players[guild_id].close()
 
+    def is_admin(self, guild, member) -> bool:
+        """Check if user has admin/manage guild permissions or is guild owner."""
+        if not guild or not member:
+            return False
+        if getattr(guild, "owner_id", None) == getattr(member, "id", None):
+            return True
+        perms = getattr(member, "guild_permissions", None)
+        return bool(perms and (getattr(perms, "manage_guild", False) or getattr(perms, "administrator", False)))
+
     def can_control(self, guild, member, settings: Settings | None = None) -> bool:
         """Check if user is authorized to control playback."""
         if not guild or not member:
@@ -742,15 +751,17 @@ class Plexcord(discord.Client):
             settings = self.store.get(guild.id)
         if not settings.dj_only:
             return True
-        perms = getattr(member, "guild_permissions", None)
-        if perms and (getattr(perms, "manage_guild", False) or getattr(perms, "administrator", False)):
-            return True
-        if getattr(guild, "owner_id", None) == getattr(member, "id", None):
+        if self.is_admin(guild, member):
             return True
         if settings.dj_role:
-            member_roles = getattr(member, "roles", [])
-            if any(getattr(r, "id", None) == settings.dj_role for r in member_roles):
-                return True
+            try:
+                target_role = int(settings.dj_role)
+            except (ValueError, TypeError):
+                target_role = None
+            if target_role:
+                member_roles = getattr(member, "roles", [])
+                if any(getattr(r, "id", None) == target_role for r in member_roles):
+                    return True
         return False
 
     def require_voice(self, interaction, *, dj=False):

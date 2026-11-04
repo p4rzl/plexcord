@@ -178,6 +178,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(bot.can_control(guild, user_dj, settings))
             self.assertTrue(bot.can_control(guild, user_owner, settings))
 
+            self.assertTrue(bot.is_admin(guild, user_admin))
+            self.assertTrue(bot.is_admin(guild, user_owner))
+            self.assertFalse(bot.is_admin(guild, user_normal))
+            self.assertFalse(bot.is_admin(guild, user_dj))
+
             # Verifica require_voice e PlayerView con dj_only
             interaction_normal = SimpleNamespace(user=user_normal, guild=guild, guild_id=1)
             interaction_dj = SimpleNamespace(user=user_dj, guild=guild, guild_id=1)
